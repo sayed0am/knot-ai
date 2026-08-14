@@ -1,0 +1,45 @@
+{
+  "capturedAt": "2026-08-01T00:00:00Z",
+  "connection": "support_mcp",
+  "tools": [
+    {
+      "description": "",
+      "inputSchema": {
+        "properties": {
+          "a": {
+            "title": "A",
+            "type": "integer"
+          },
+          "b": {
+            "title": "B",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "a",
+          "b"
+        ],
+        "title": "addArguments",
+        "type": "object"
+      },
+      "name": "add"
+    },
+    {
+      "description": "",
+      "inputSchema": {
+        "properties": {
+          "message": {
+            "title": "Message",
+            "type": "string"
+          }
+        },
+        "required": [
+          "message"
+        ],
+        "title": "echoArguments",
+        "type": "object"
+      },
+      "name": "echo"
+    }
+  ]
+}

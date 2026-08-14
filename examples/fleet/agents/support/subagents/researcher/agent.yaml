@@ -1,0 +1,10 @@
+description: >-
+  Searches internal account notes for context relevant to a support ticket.
+  Invoke with a short, specific natural-language request describing what to
+  look for (an order id or account detail); it has no memory of the parent
+  conversation.
+model:
+  provider: anthropic
+  name: claude-3-5-haiku-20241022
+approvals:
+  search_notes: always

@@ -1,0 +1,19 @@
+description: >-
+  Shared CRM tools for support-facing agents: mutate customer records, flag
+  accounts for review, and reach the internal support MCP server.
+approvals:
+  update_customer: always
+  flag_account: once
+connections:
+  support_mcp:
+    url: https://mcp.internal.example.com/support
+    transport: streamable_http
+    description: >-
+      Internal support MCP server exposing small utility tools (used here to
+      demonstrate connection declarations; only 'add' is allow-listed from
+      its full tool set — 'echo' and others stay unreachable to this agent).
+    allow:
+      - add
+    auth_env: SUPPORT_MCP_TOKEN
+    provided_arguments:
+      a: account_id

@@ -1,0 +1,45 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          enable-cache: true
+          python-version: "3.12"
+
+      # 1. Install every dependency group (including the optional `litellm`
+      #    extra) so the full test matrix — providers, authoring, server —
+      #    can actually import everything it exercises.
+      - name: Install dependencies
+        run: uv sync --all-extras
+
+      # 2. Lint: fails on any style/import-order/upgrade violation.
+      - name: Lint (ruff)
+        run: uv run ruff check .
+
+      # 3. Full test suite. This inherently includes:
+      #    - tests/test_import_direction.py::test_import_direction, which
+      #      enforces the providers < core < authoring < server layering
+      #      (a lower layer may never import a higher one); and
+      #    - tests/test_session_secrets.py, the no-secrets boundary suite,
+      #      which proves runtime secret material (bearer tokens, etc.)
+      #      never reaches durable session storage.
+      - name: Test (pytest)
+        run: uv run pytest -q
+
+      # 4. Fleet validation: compiles examples/fleet and checks its
+      #    committed manifests under examples/manifests for drift
+      #    (manifest-drift / bundle-edit blast-radius detection). Exit 2 on
+      #    drift, exit 1 on any compile failure — either fails this step.
+      - name: Validate example fleet
+        run: uv run knot validate --root examples/fleet --manifests examples/manifests --check

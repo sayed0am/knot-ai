@@ -1,0 +1,13 @@
+description: >-
+  Front-line customer support triage agent: looks up orders, applies refund
+  policy, and updates CRM records under human approval.
+model:
+  provider: anthropic
+  name: claude-3-5-haiku-20241022
+  max_tokens: 1024
+limits:
+  max_turns: 12
+  delegation_max_per_turn: 2
+  delegation_max_concurrent: 1
+use:
+  - crm

@@ -1,0 +1,210 @@
+{
+  "agentId": "support",
+  "instructionsPath": "agents/support/instructions.md",
+  "instructionsSha256": "bcb2e4dfd83cdddc52fae602d0119dccf6ab8f40f67428236c528166877dbdff",
+  "limits": {
+    "delegationMaxConcurrent": 1,
+    "delegationMaxPerTurn": 2,
+    "maxResultBytes": null,
+    "maxTurns": 12
+  },
+  "model": {
+    "maxTokens": 1024,
+    "name": "claude-3-5-haiku-20241022",
+    "provider": "anthropic"
+  },
+  "skills": [
+    {
+      "description": "How to evaluate refund eligibility and process a refund request for a customer order.",
+      "id": "refund-policy",
+      "name": "Refund Policy",
+      "path": "agents/support/skills/refund-policy",
+      "source": "authored"
+    }
+  ],
+  "subagentIds": [
+    "researcher"
+  ],
+  "tools": [
+    {
+      "approval": "never",
+      "description": "Ask the human user a question when you need information that only they can provide (a decision, a missing fact, a preference). Calling this tool pauses the run until the human answers; the answer is returned as this call's result on the next turn.",
+      "executable": false,
+      "idempotent": false,
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "options": {
+            "description": "Optional suggested answers to offer the human user.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "question": {
+            "description": "The question to put to the human user.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "question"
+        ],
+        "type": "object"
+      },
+      "name": "ask_user",
+      "source": "builtin"
+    },
+    {
+      "approval": "once",
+      "description": "Flag a customer account for manual review by the trust & safety team.",
+      "executable": true,
+      "idempotent": false,
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "customer_id": {
+            "description": "The customer id to flag for review.",
+            "title": "Customer Id",
+            "type": "string"
+          },
+          "reason": {
+            "description": "Why this account is being flagged.",
+            "title": "Reason",
+            "type": "string"
+          }
+        },
+        "required": [
+          "customer_id",
+          "reason"
+        ],
+        "type": "object"
+      },
+      "name": "flag_account",
+      "source": "bundle:crm"
+    },
+    {
+      "approval": "never",
+      "description": "Load the full instructions for one of this agent's available skills by id.",
+      "executable": true,
+      "idempotent": true,
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "skill": {
+            "enum": [
+              "refund-policy"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "skill"
+        ],
+        "type": "object"
+      },
+      "name": "load_skill",
+      "source": "builtin"
+    },
+    {
+      "approval": "never",
+      "description": "Look up an order's current shipping status by its order id.",
+      "executable": true,
+      "idempotent": true,
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "order_id": {
+            "description": "The order id to look up, e.g. 'ORD-1001'.",
+            "title": "Order Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "order_id"
+        ],
+        "type": "object"
+      },
+      "name": "lookup_order",
+      "source": "authored"
+    },
+    {
+      "approval": "never",
+      "description": "Searches internal account notes for context relevant to a support ticket. Invoke with a short, specific natural-language request describing what to look for (an order id or account detail); it has no memory of the parent conversation.",
+      "executable": true,
+      "idempotent": false,
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "message": {
+            "description": "The message to delegate to this subagent.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "message"
+        ],
+        "type": "object"
+      },
+      "name": "researcher",
+      "source": "subagent"
+    },
+    {
+      "approval": "never",
+      "description": "",
+      "executable": false,
+      "idempotent": false,
+      "inputSchema": {
+        "properties": {
+          "b": {
+            "title": "B",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "b"
+        ],
+        "title": "addArguments",
+        "type": "object"
+      },
+      "name": "support_mcp__add",
+      "source": "connection:crm/support_mcp"
+    },
+    {
+      "approval": "always",
+      "description": "Update one field on a customer record.",
+      "executable": true,
+      "idempotent": false,
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "customer_id": {
+            "description": "The customer id to update, e.g. 'CUST-42'.",
+            "title": "Customer Id",
+            "type": "string"
+          },
+          "field": {
+            "description": "The customer field to change, e.g. 'email' or 'tier'.",
+            "title": "Field",
+            "type": "string"
+          },
+          "value": {
+            "description": "The new value for that field.",
+            "title": "Value",
+            "type": "string"
+          }
+        },
+        "required": [
+          "customer_id",
+          "field",
+          "value"
+        ],
+        "type": "object"
+      },
+      "name": "update_customer",
+      "source": "bundle:crm"
+    }
+  ],
+  "use": [
+    "crm"
+  ]
+}
