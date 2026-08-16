@@ -65,6 +65,11 @@ compaction:
   retain_budget: 0.16
   summarization_model: null
   max_overflow_retries: 1
+repeat_guard:
+  enabled: true
+  thresholds: [3, 5, 8]
+  exclude: [ask_user, load_skill]
+  preview_cap: 500
 ```
 
 | Field | Type | Default | Meaning |
@@ -81,6 +86,7 @@ compaction:
 | `use` | `list[str]` | `[]` | Bundle ids (directory names under `shared/`) whose tools, skills, and approvals this agent pulls in. See [`docs/bundles.md`](bundles.md). |
 | `approvals` | `dict[str, "never"\|"once"\|"always"]` | `{}` | Per-tool approval policy overrides. **Agent-level approvals always win over a bundle's** — see [`docs/bundles.md`](bundles.md) for the full vocabulary and suffix-matching rule. |
 | `compaction.*` | — | enabled, defaults below | Context compaction settings — see [Context compaction](#context-compaction) below for the full field list and validation rules. |
+| `repeat_guard.*` | — | enabled, defaults below | Repeat-tool-call guard settings — see [Repeat-tool-call guard](#repeat-tool-call-guard) below for the full field list, exclusion semantics, and validation rules. |
 
 If `model:` is omitted entirely, the session runs with the runtime's
 `default_model` (a fallback the server operator configures, not part of
@@ -323,6 +329,117 @@ much of the model-visible history has been summarized away. Rehydrating a
 compacted session after a restart derives exactly the same post-compaction
 history the live session had — same durability guarantee as every other
 fact knot records.
+
+## Repeat-tool-call guard
+
+An unattended model that gets stuck re-issuing the same tool call with the
+same arguments burns tokens and turns until `max_turns` kills the run. The
+repeat-tool-call guard breaks these loops early by injecting escalating
+advisory messages — it is on by default, and never blocks, delays, or
+rewrites a call.
+
+```yaml
+repeat_guard:
+  enabled: true
+  thresholds: [3, 5, 8]
+  exclude: [ask_user, load_skill]
+  preview_cap: 500
+```
+
+| Field | Type | Default | Meaning |
+|---|---|---|---|
+| `enabled` | `bool` | `true` | Turns the guard off entirely for this agent when `false`. |
+| `thresholds` | `list[int]` | `[3, 5, 8]` | Consecutive-call counts at which an advisory fires. Normalized ascending on read, so the *lowest* value is always what decides "first vs. later" advisory wording (see below), regardless of the order written in `agent.yaml`. |
+| `exclude` | `list[str]` | `[ask_user, load_skill]` | Tool-name patterns that are transparent to the chain — see below. |
+| `preview_cap` | `int`, `> 0` | `500` | Maximum characters of the repeated call's canonicalized arguments shown in a later-threshold advisory. Bounds only the advisory *text*; detection always compares the full arguments regardless of this cap. |
+
+Invalid values fail fleet compilation with a diagnostic naming the
+offending field (`knot validate` reports it like any other compile error):
+an empty `thresholds` list, a non-integer or boolean entry, a threshold
+below `2`, duplicate thresholds, or a non-positive `preview_cap`. An agent
+with no `repeat_guard:` block at all still gets the guard, enabled, at the
+default thresholds.
+
+### Detection: consecutive identical calls
+
+The guard tracks, per live run, consecutive tool calls sharing the same key
+of `(tool name, canonicalized arguments)` — canonicalization is a deep
+key-sort plus compact JSON serialization, so two argument objects differing
+only in property order count as identical. A call with a different key
+resets the running count to 1. Calls are counted in the exact order the
+model emitted them, including calls a decision hook denies and calls naming
+an unknown tool — a model hammering a call that keeps getting denied is
+exactly the loop worth breaking, so denial doesn't exempt a call from the
+count.
+
+### Exclusions are transparent, not exempt
+
+`exclude` entries match tool names with the same `*`-wildcard and
+`__`-qualified-suffix convention `approvals` uses (see
+[`docs/bundles.md`](bundles.md)) — so `exclude: [load_skill]` also covers a
+connection-qualified `crm__load_skill` without spelling out
+`*__load_skill`. A call matching an exclusion pattern is *transparent* to
+the chain: it neither increments nor resets the running count, so
+interleaving an excluded call between two identical tracked calls can't
+launder a loop — `search("x")`, `load_skill(...)`, `search("x")` still
+counts as two consecutive `search` calls, not a reset-and-restart. The
+default exclusions cover knot's own bookkeeping surface: `ask_user`'s
+repetition is already governed by parking, and a repeated `load_skill`
+fetch is near-identical by design and harmless.
+
+### What the model sees
+
+When a consecutive run reaches a configured threshold, the guard queues an
+advisory and delivers it as an ordinary `user`-role message at the *next*
+turn start, through the same append+emit path steering messages use —
+appended to history, emitted as `MessageStart`/`MessageEnd` events, and
+logged to the entry log exactly like a steering message. Its text is
+wrapped in `<repeat-tool-reminder>...</repeat-tool-reminder>` tags, the
+same way a compaction summary is wrapped in `<compacted-summary>` tags, so
+the model can tell it's reading framework-authored guidance rather than
+something the human user actually typed — providers still see it as
+ordinary user text.
+
+The **first** (lowest) configured threshold gets a short, generic nudge: go
+re-read the previous result, and either try a different approach or
+conclude. **Later** thresholds name the tool, the consecutive count, and a
+`preview_cap`-bounded preview of the repeated canonical arguments, so the
+model has enough context to actually change course:
+
+```
+<repeat-tool-reminder>
+You have now called `search` with identical arguments 5 times in a row.
+Carefully analyze the previous result before calling again: if the task is
+not complete, try a different approach or different arguments, or conclude
+instead of repeating the call. Repeated arguments: {"q":"cats"}
+</repeat-tool-reminder>
+```
+
+Each configured threshold fires **at most once per run** — crossing the
+same threshold again later in the same run (after the chain resets and
+regrows past it) does not re-nag. The call that crosses a threshold still
+executes (or is denied) exactly as it would without the guard; the guard
+never inspects, delays, or alters a result.
+
+### Chain resets
+
+A new user message, a steering message, or a follow-up message entering the
+conversation resets the running count to zero — the chain only ever tracks
+one *uninterrupted* stretch of identical tool calls. Thresholds already
+fired this run stay fired, though: the once-per-threshold rule survives a
+reset, so a chain that resets, regrows, and crosses the same threshold
+again does not advise twice.
+
+### Chain state is per-run; advisories are durable history
+
+The consecutive-call counter itself is in-memory and scoped to one live
+run — a session that parks mid-run and later resumes starts counting from
+zero again on its first tracked call after resume. This is a heuristic
+nudge, not a logged invariant: the framework doesn't reconstruct chain
+state from the entry log the way it reconstructs conversation history.
+Advisories *already delivered*, however, are ordinary durable `"message"`
+entries like any other model-visible input — they survive a restart in
+their original position in the session's history, same as any other turn.
 
 ## Subagents
 

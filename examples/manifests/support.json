@@ -22,6 +22,19 @@
     "name": "claude-3-5-haiku-20241022",
     "provider": "anthropic"
   },
+  "repeatGuard": {
+    "enabled": true,
+    "exclude": [
+      "ask_user",
+      "load_skill"
+    ],
+    "previewCap": 500,
+    "thresholds": [
+      3,
+      5,
+      8
+    ]
+  },
   "skills": [
     {
       "description": "How to evaluate refund eligibility and process a refund request for a customer order.",

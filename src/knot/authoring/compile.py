@@ -747,6 +747,7 @@ def compile_agent(discovery: AgentDiscovery, fleet: FleetContext) -> CompiledAge
         model=config.model,
         limits=config.limits,
         compaction=config.compaction,
+        repeat_guard=config.repeat_guard,
         tools=manifest_tools,
         skills=manifest_skills,
         subagent_ids=subagent_ids,

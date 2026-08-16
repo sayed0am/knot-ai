@@ -312,6 +312,151 @@ def test_compaction_unknown_key_is_rejected(tmp_path: Path) -> None:
     assert diagnostics[0].severity == "error"
 
 
+def test_repeat_guard_block_defaults_when_absent(tmp_path: Path) -> None:
+    write_files(tmp_path, {"agent.yaml": "description: minimal\n"})
+
+    config, diagnostics = load_agent_config(tmp_path / "agent.yaml", agent_id="helper")
+
+    assert diagnostics == []
+    assert config is not None
+    assert config.repeat_guard.enabled is True
+    assert config.repeat_guard.thresholds == [3, 5, 8]
+    assert config.repeat_guard.exclude == ["ask_user", "load_skill"]
+    assert config.repeat_guard.preview_cap == 500
+
+
+def test_repeat_guard_block_parses_explicit_values(tmp_path: Path) -> None:
+    write_files(
+        tmp_path,
+        {
+            "agent.yaml": """
+                repeat_guard:
+                  enabled: false
+                  thresholds: [4, 2, 6]
+                  exclude: [crm__*, ping]
+                  preview_cap: 100
+            """
+        },
+    )
+
+    config, diagnostics = load_agent_config(tmp_path / "agent.yaml", agent_id="helper")
+
+    assert diagnostics == []
+    assert config is not None
+    assert config.repeat_guard.enabled is False
+    assert config.repeat_guard.thresholds == [2, 4, 6]  # normalized ascending
+    assert config.repeat_guard.exclude == ["crm__*", "ping"]
+    assert config.repeat_guard.preview_cap == 100
+
+
+def test_repeat_guard_empty_thresholds_is_rejected(tmp_path: Path) -> None:
+    write_files(
+        tmp_path,
+        {
+            "agent.yaml": """
+                repeat_guard:
+                  thresholds: []
+            """
+        },
+    )
+
+    config, diagnostics = load_agent_config(tmp_path / "agent.yaml", agent_id="helper")
+
+    assert config is None
+    assert len(diagnostics) == 1
+    assert "thresholds" in diagnostics[0].message
+
+
+def test_repeat_guard_non_integer_threshold_is_rejected(tmp_path: Path) -> None:
+    write_files(
+        tmp_path,
+        {
+            "agent.yaml": """
+                repeat_guard:
+                  thresholds: [3, 4.5]
+            """
+        },
+    )
+
+    config, diagnostics = load_agent_config(tmp_path / "agent.yaml", agent_id="helper")
+
+    assert config is None
+    assert len(diagnostics) == 1
+    assert "thresholds" in diagnostics[0].message
+
+
+def test_repeat_guard_threshold_below_two_is_rejected(tmp_path: Path) -> None:
+    write_files(
+        tmp_path,
+        {
+            "agent.yaml": """
+                repeat_guard:
+                  thresholds: [1, 3]
+            """
+        },
+    )
+
+    config, diagnostics = load_agent_config(tmp_path / "agent.yaml", agent_id="helper")
+
+    assert config is None
+    assert len(diagnostics) == 1
+    assert "thresholds" in diagnostics[0].message
+
+
+def test_repeat_guard_duplicate_thresholds_are_rejected(tmp_path: Path) -> None:
+    write_files(
+        tmp_path,
+        {
+            "agent.yaml": """
+                repeat_guard:
+                  thresholds: [3, 3, 5]
+            """
+        },
+    )
+
+    config, diagnostics = load_agent_config(tmp_path / "agent.yaml", agent_id="helper")
+
+    assert config is None
+    assert len(diagnostics) == 1
+    assert "thresholds" in diagnostics[0].message
+
+
+def test_repeat_guard_non_positive_preview_cap_is_rejected(tmp_path: Path) -> None:
+    write_files(
+        tmp_path,
+        {
+            "agent.yaml": """
+                repeat_guard:
+                  preview_cap: 0
+            """
+        },
+    )
+
+    config, diagnostics = load_agent_config(tmp_path / "agent.yaml", agent_id="helper")
+
+    assert config is None
+    assert len(diagnostics) == 1
+    assert "preview_cap" in diagnostics[0].message
+
+
+def test_repeat_guard_unknown_key_is_rejected(tmp_path: Path) -> None:
+    write_files(
+        tmp_path,
+        {
+            "agent.yaml": """
+                repeat_guard:
+                  not_a_real_field: true
+            """
+        },
+    )
+
+    config, diagnostics = load_agent_config(tmp_path / "agent.yaml", agent_id="helper")
+
+    assert config is None
+    assert len(diagnostics) == 1
+    assert diagnostics[0].severity == "error"
+
+
 def test_bare_agent_yaml_uses_all_defaults(tmp_path: Path) -> None:
     write_files(tmp_path, {"agent.yaml": "description: minimal\n"})
 

@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import asyncio
 import uuid
+from collections import deque
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from contextlib import suppress
 from contextvars import ContextVar
@@ -46,6 +47,7 @@ from knot.core.events import (
     TurnStartEvent,
 )
 from knot.core.invariant import HistoryDivergenceError
+from knot.core.repeat_guard import RepeatChain, RepeatGuardSettings, build_advisory
 from knot.core.tool_history import provider_context
 from knot.core.tools import AgentTool, AgentToolResult, ToolParkedError, execute_tool
 from knot.core.truncation import SpillSink
@@ -117,6 +119,7 @@ async def run_agent_loop(
     default_question_ttl_seconds: int | None = None,
     pre_request_hook: Callable[[Sequence[AgentMessage]], Awaitable[None]] | None = None,
     pre_turn_hook: Callable[[list[AgentMessage]], Awaitable[Sequence[AgentEvent]]] | None = None,
+    repeat_guard: RepeatGuardSettings | None = None,
 ) -> AsyncIterator[AgentEvent]:
     """Run the provider/tool loop, emitting the core agent event grammar.
 
@@ -151,10 +154,30 @@ async def run_agent_loop(
     ``emit_loop_event``), a pre-turn hook runs outside the tool phase's
     queue context, so it cannot use ``emit_loop_event``; returning its
     events directly is the only channel it has.
+
+    ``repeat_guard``, when given, tracks consecutive identical tool calls
+    (see ``knot.core.repeat_guard``) over one ``RepeatChain`` scoped to this
+    single run. When a configured threshold fires during a tool phase, the
+    advisory it produces is queued and delivered at the *next* turn start
+    through the exact same append+emit path steering messages use — history
+    append, ``MessageStart``/``MessageEnd`` events — so it lands in the
+    entry log identically to a steering message. The chain itself resets
+    whenever a non-guard message (a prompt, a steering message, a follow-up)
+    is admitted through that same path; the guard is advisory-only and never
+    touches decisions, execution, or results.
     """
     new_messages = list(prompts)
     if prompts:
         messages.extend(prompts)
+
+    repeat_chain = RepeatChain() if repeat_guard is not None else None
+    # Advisories fired during a tool phase, queued for delivery at the next
+    # turn start (see the docstring above). Tagged by identity in
+    # ``advisory_ids`` so the pending-delivery loop below can tell them
+    # apart from ordinary steering/follow-up messages without inspecting
+    # message content — only non-guard entries reset the chain.
+    pending_advisories: deque[AgentMessage] = deque()
+    advisory_ids: set[int] = set()
 
     yield AgentStartEvent()
     yield TurnStartEvent()
@@ -189,6 +212,8 @@ async def run_agent_loop(
             first_turn = False
 
             for message in pending:
+                if repeat_chain is not None and id(message) not in advisory_ids:
+                    repeat_chain.reset()
                 messages.append(message)
                 new_messages.append(message)
                 yield MessageStartEvent(message=message)
@@ -258,6 +283,7 @@ async def run_agent_loop(
             pending_requests: list[PendingInputRequest] = []
 
             if calls:
+                fired_advisories: list[AgentMessage] = []
                 async for event in _run_tool_phase(
                     calls,
                     tool_by_name,
@@ -268,8 +294,14 @@ async def run_agent_loop(
                     tool_results,
                     pending_requests,
                     default_question_ttl_seconds,
+                    repeat_guard,
+                    repeat_chain,
+                    fired_advisories,
                 ):
                     yield event
+                for advisory in fired_advisories:
+                    advisory_ids.add(id(advisory))
+                    pending_advisories.append(advisory)
                 for result in tool_results:
                     messages.append(result)
                     new_messages.append(result)
@@ -292,7 +324,9 @@ async def run_agent_loop(
 
             yield TurnEndEvent(message=assistant, tool_results=tool_results)
             turn += 1
-            pending = tuple(get_steering_messages() if get_steering_messages else ())
+            steering = tuple(get_steering_messages() if get_steering_messages else ())
+            pending = tuple(pending_advisories) + steering
+            pending_advisories.clear()
 
         follow_ups = tuple(get_follow_up_messages() if get_follow_up_messages else ())
         if follow_ups:
@@ -364,15 +398,41 @@ async def _run_tool_phase(
     tool_results: list[ToolResultMessage],
     pending_requests: list[PendingInputRequest],
     default_question_ttl_seconds: int | None = None,
+    repeat_guard: RepeatGuardSettings | None = None,
+    repeat_chain: RepeatChain | None = None,
+    fired_advisories: list[AgentMessage] | None = None,
 ) -> AsyncIterator[AgentEvent]:
     """Evaluate the decision hook for every call, then run allowed calls.
 
     Denied and unknown-tool calls are resolved immediately and in order.
     Allowed calls with an executor run concurrently. Gated (``RequireApproval``)
     and execute-less calls are parked: no result is synthesized for them.
+
+    The repeat-guard decision sweep runs first, in ``calls``' model-emitted
+    order, before any decision hook or dispatch — so a denied or
+    unknown-tool call still ticks the chain (spec: "Denied calls count"),
+    and counting is unaffected by allowed calls later executing
+    concurrently. Advisory ``UserMessage``s for any threshold crossed are
+    appended to ``fired_advisories``; nothing else about this method's
+    behavior changes when the guard is active or inactive.
     """
     runnable: list[tuple[ToolCall, AgentTool]] = []
     results_by_id: dict[str, ToolResultMessage] = {}
+
+    if repeat_guard is not None and repeat_chain is not None:
+        for call in calls:
+            threshold = repeat_chain.observe(call.name, call.arguments, repeat_guard)
+            if threshold is not None and fired_advisories is not None:
+                tool_name, canonical_args = repeat_chain.last_call()
+                fired_advisories.append(
+                    build_advisory(
+                        is_first_threshold=threshold == repeat_guard.thresholds[0],
+                        tool_name=tool_name,
+                        count=threshold,
+                        canonical_args=canonical_args,
+                        preview_cap=repeat_guard.preview_cap,
+                    )
+                )
 
     for call in calls:
         tool = tool_by_name.get(call.name)

@@ -19,7 +19,13 @@ import json
 
 from pydantic import Field
 
-from knot.authoring.config import ApprovalPolicyName, CompactionConfig, LimitsConfig, ModelConfig
+from knot.authoring.config import (
+    ApprovalPolicyName,
+    CompactionConfig,
+    LimitsConfig,
+    ModelConfig,
+    RepeatGuardConfig,
+)
 from knot.providers.messages import WireModel
 from knot.providers.types import JSONValue
 
@@ -55,6 +61,7 @@ class AgentManifest(WireModel):
     model: ModelConfig | None = None
     limits: LimitsConfig = Field(default_factory=LimitsConfig)
     compaction: CompactionConfig = Field(default_factory=CompactionConfig)
+    repeat_guard: RepeatGuardConfig = Field(default_factory=RepeatGuardConfig)
     tools: list[ManifestTool] = Field(default_factory=list)
     skills: list[ManifestSkill] = Field(default_factory=list)
     subagent_ids: list[str] = Field(default_factory=list)

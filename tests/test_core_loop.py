@@ -14,6 +14,7 @@ from knot.core.events import (
 )
 from knot.core.invariant import DivergenceReport, HistoryDivergenceError
 from knot.core.loop import run_agent_loop
+from knot.core.repeat_guard import ADVISORY_TAG_OPEN, RepeatGuardSettings
 from knot.core.tool_history import repair_tool_history
 from knot.core.tools import AgentTool, AgentToolResult, ToolParkedError
 from knot.providers.fake import FakeProvider, error, reply, tool_call
@@ -664,3 +665,246 @@ async def test_cancel_mid_tool_ends_aborted_and_history_is_rehydratable() -> Non
     assert report.changed is True
     result_ids = {m.tool_call_id for m in report.messages if isinstance(m, ToolResultMessage)}
     assert result_ids == {"call_slow", "call_fast"}
+
+
+# ---------------------------------------------------------------------------
+# Repeat-tool-call guard (loop integration; the pure module itself is
+# covered by tests/test_core_repeat_guard.py).
+# ---------------------------------------------------------------------------
+
+
+def _advisory_messages(events: list[AgentEvent]) -> list[UserMessage]:
+    return [
+        e.message
+        for e in events
+        if isinstance(e, MessageEndEvent)
+        and isinstance(e.message, UserMessage)
+        and ADVISORY_TAG_OPEN in e.message.text
+    ]
+
+
+async def test_repeat_guard_fires_advisory_delivered_at_next_turn_start() -> None:
+    provider = FakeProvider(
+        [
+            tool_call("search", {"q": "cats"}),
+            tool_call("search", {"q": "cats"}),
+            tool_call("search", {"q": "cats"}),
+            reply("done"),
+        ]
+    )
+    tool = _echo_tool("search")
+
+    events = await _collect(
+        provider=provider,
+        model="m",
+        system="s",
+        messages=[],
+        tools=[tool],
+        prompts=[UserMessage(content="go")],
+        repeat_guard=RepeatGuardSettings(thresholds=(3,)),
+    )
+
+    end = events[-1]
+    assert isinstance(end, AgentEndEvent)
+    assert end.outcome == "completed"
+
+    advisories = _advisory_messages(events)
+    assert len(advisories) == 1
+
+    # Delivered as an ordinary MessageStart/End pair — the same path
+    # steering messages use — and appears in the *next* provider request
+    # (the 4th call, index 3), not the one that crossed the threshold.
+    fourth_call_messages = provider.calls[3][2]
+    assert any(
+        isinstance(m, UserMessage) and ADVISORY_TAG_OPEN in m.text for m in fourth_call_messages
+    )
+    third_call_messages = provider.calls[2][2]
+    assert not any(
+        isinstance(m, UserMessage) and ADVISORY_TAG_OPEN in m.text for m in third_call_messages
+    )
+
+    # Advisory-only proof: the threshold-crossing call still executed
+    # normally, with an unchanged result.
+    tool_result_messages = [
+        e.message
+        for e in events
+        if isinstance(e, MessageEndEvent) and isinstance(e.message, ToolResultMessage)
+    ]
+    assert len(tool_result_messages) == 3
+    assert all(m.text == "search-result" and not m.is_error for m in tool_result_messages)
+
+
+async def test_repeat_guard_denied_calls_still_count() -> None:
+    async def deny_everything(call: ToolCall, tool: AgentTool | None):
+        return Deny("not allowed")
+
+    provider = FakeProvider(
+        [
+            tool_call("search", {"q": "cats"}),
+            tool_call("search", {"q": "cats"}),
+            tool_call("search", {"q": "cats"}),
+            reply("done"),
+        ]
+    )
+    tool = _echo_tool("search")
+
+    events = await _collect(
+        provider=provider,
+        model="m",
+        system="s",
+        messages=[],
+        tools=[tool],
+        prompts=[UserMessage(content="go")],
+        tool_decision_hook=deny_everything,
+        repeat_guard=RepeatGuardSettings(thresholds=(3,)),
+    )
+
+    assert len(_advisory_messages(events)) == 1
+
+
+async def test_repeat_guard_excluded_tool_is_transparent_to_the_chain() -> None:
+    """An identical tracked call separated by an excluded (but still
+    executable) tool call keeps counting across the interleaving."""
+    provider = FakeProvider(
+        [
+            tool_call("search", {"q": "cats"}),
+            tool_call("log_note", {"note": "checked"}),
+            tool_call("search", {"q": "cats"}),
+            reply("done"),
+        ]
+    )
+    tools = [_echo_tool("search"), _echo_tool("log_note")]
+
+    events = await _collect(
+        provider=provider,
+        model="m",
+        system="s",
+        messages=[],
+        tools=tools,
+        prompts=[UserMessage(content="go")],
+        repeat_guard=RepeatGuardSettings(thresholds=(2,), exclude=("log_note",)),
+    )
+
+    assert len(_advisory_messages(events)) == 1
+
+
+async def test_repeat_guard_steering_resets_chain() -> None:
+    provider = FakeProvider(
+        [
+            tool_call("search", {"q": "cats"}),
+            tool_call("search", {"q": "cats"}),
+            tool_call("search", {"q": "cats"}),
+            tool_call("search", {"q": "cats"}),
+            reply("done"),
+        ]
+    )
+    tool = _echo_tool("search")
+    steer_messages = [UserMessage(content="also check dogs")]
+
+    def get_steering():
+        # Delivered once, right after the second tool call's turn ends —
+        # before it, the chain would be at count 2; a third identical call
+        # without the reset would cross threshold 3.
+        if len(provider.calls) == 2 and steer_messages:
+            return (steer_messages.pop(0),)
+        return ()
+
+    events = await _collect(
+        provider=provider,
+        model="m",
+        system="s",
+        messages=[],
+        tools=[tool],
+        prompts=[UserMessage(content="go")],
+        get_steering_messages=get_steering,
+        repeat_guard=RepeatGuardSettings(thresholds=(3,)),
+    )
+
+    assert _advisory_messages(events) == []
+
+
+async def test_repeat_guard_first_vs_later_advisory_content() -> None:
+    provider = FakeProvider(
+        [
+            tool_call("search", {"q": "cats"}),
+            tool_call("search", {"q": "cats"}),
+            tool_call("search", {"q": "cats"}),
+            tool_call("search", {"q": "cats"}),
+            reply("done"),
+        ]
+    )
+    tool = _echo_tool("search")
+
+    events = await _collect(
+        provider=provider,
+        model="m",
+        system="s",
+        messages=[],
+        tools=[tool],
+        prompts=[UserMessage(content="go")],
+        repeat_guard=RepeatGuardSettings(thresholds=(2, 4)),
+    )
+
+    advisories = _advisory_messages(events)
+    assert len(advisories) == 2
+
+    first, later = advisories
+    assert "search" not in first.text
+    assert "search" in later.text
+    assert "4" in later.text
+    assert '"q":"cats"' in later.text
+
+
+async def test_repeat_guard_once_per_threshold_per_run() -> None:
+    """Even across many more repeats than the configured thresholds, each
+    threshold fires exactly once for the whole run."""
+    calls = [tool_call("search", {"q": "cats"}) for _ in range(6)]
+    provider = FakeProvider([*calls, reply("done")])
+    tool = _echo_tool("search")
+
+    events = await _collect(
+        provider=provider,
+        model="m",
+        system="s",
+        messages=[],
+        tools=[tool],
+        prompts=[UserMessage(content="go")],
+        repeat_guard=RepeatGuardSettings(thresholds=(2, 4)),
+    )
+
+    assert len(_advisory_messages(events)) == 2
+
+
+async def test_repeat_guard_disabled_never_fires() -> None:
+    calls = [tool_call("search", {"q": "cats"}) for _ in range(5)]
+    provider = FakeProvider([*calls, reply("done")])
+    tool = _echo_tool("search")
+
+    events = await _collect(
+        provider=provider,
+        model="m",
+        system="s",
+        messages=[],
+        tools=[tool],
+        prompts=[UserMessage(content="go")],
+        repeat_guard=RepeatGuardSettings(enabled=False, thresholds=(2, 3)),
+    )
+
+    assert _advisory_messages(events) == []
+
+
+async def test_repeat_guard_default_none_never_fires() -> None:
+    calls = [tool_call("search", {"q": "cats"}) for _ in range(5)]
+    provider = FakeProvider([*calls, reply("done")])
+    tool = _echo_tool("search")
+
+    events = await _collect(
+        provider=provider,
+        model="m",
+        system="s",
+        messages=[],
+        tools=[tool],
+        prompts=[UserMessage(content="go")],
+    )
+
+    assert _advisory_messages(events) == []

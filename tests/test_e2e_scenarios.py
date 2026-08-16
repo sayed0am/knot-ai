@@ -18,11 +18,12 @@ from authoring_fixtures import write_files
 from server_fixtures import client_for, make_app, parse_sse
 
 from knot.authoring.compile import compile_fleet
-from knot.core.session.entries import ENTRY_TYPE_COMPACTION, ENTRY_TYPE_MESSAGE
+from knot.core.repeat_guard import ADVISORY_TAG_OPEN
+from knot.core.session.entries import ENTRY_TYPE_COMPACTION, ENTRY_TYPE_MESSAGE, entry_to_message
 from knot.core.session.state import derive_state
 from knot.core.session.store import SessionStore
 from knot.providers.fake import FakeProvider, error, reply, tool_call
-from knot.providers.messages import ToolResultMessage, Usage
+from knot.providers.messages import ToolResultMessage, Usage, UserMessage
 from knot.server.app import create_app
 
 _FLEET_ROOT = Path(__file__).resolve().parent.parent / "examples" / "fleet"
@@ -758,3 +759,153 @@ async def test_scenario_reactive_compaction_recovers_then_exhausts_retries(
 
         compaction_frames_b = [data for etype, data in events2b if etype == "compaction"]
         assert len(compaction_frames_b) == 1  # the cap allowed exactly one compaction attempt
+
+
+# ---------------------------------------------------------------------------
+# Scenario 8: repeat-tool-call guard fires over the SSE stream, is logged
+# durably, and the chain is fresh after a park + restart
+# ---------------------------------------------------------------------------
+
+_REPEAT_GUARD_AGENT_YAML = """
+    repeat_guard:
+      thresholds: [2]
+"""
+
+
+def _repeat_guard_fleet(root: Path) -> None:
+    write_files(
+        root,
+        {
+            "agents/root/instructions.md": "you are root\n",
+            "agents/root/agent.yaml": _REPEAT_GUARD_AGENT_YAML,
+            "agents/root/tools/search.py": """
+                from knot.authoring.tools import tool
+
+
+                @tool
+                def search(q: str) -> str:
+                    \"\"\"Search for something.\"\"\"
+                    return f"result:{q}"
+            """,
+        },
+    )
+
+
+async def test_scenario_repeat_guard_advisory_on_stream_logged_and_fresh_after_resume(
+    tmp_path: Path,
+) -> None:
+    """A scripted model calls the identical tool with identical arguments
+    past the (lowered, for the test) first threshold. The advisory shows up
+    on the SSE stream as an ordinary user-role message event, appearing
+    before the next request's own events, and is present in the durable
+    entry log alongside the tool-call/tool-result entries. The process is
+    then "restarted" (a fresh app + store over the same sqlite file,
+    matching Scenario 4/6's restart pattern): the resumed session's derived
+    history still carries the advisory at the same position it held before
+    the restart -- history integrity across park/resume. (That a *fresh*
+    chain starts counting from zero after resume is proven at the unit
+    level, not here -- see design.md and tasks.md 3.4/stage-A tests.)"""
+    db_path = str(tmp_path / "knot.db")
+    _repeat_guard_fleet(tmp_path)
+
+    provider1 = FakeProvider(
+        [
+            tool_call("search", {"q": "cats"}, id="call_1"),
+            tool_call("search", {"q": "cats"}, id="call_2"),
+            reply("done searching"),
+        ]
+    )
+    app1 = make_app(tmp_path, [], db_path=db_path, provider=provider1)
+
+    async with client_for(app1) as client1:
+        session_id = (await client1.post("/agents/root/sessions")).json()["sessionId"]
+
+        stream = await client1.post(
+            f"/sessions/{session_id}/messages",
+            json={"text": "find cats twice"},
+        )
+        assert stream.status_code == 200
+        events = parse_sse(stream.text)
+
+        assert events[-1][0] == "agent_end"
+        assert events[-1][1]["outcome"] == "completed"
+
+        # -- the advisory appears on the stream as an ordinary user-role
+        #    message event ------------------------------------------------
+        message_end_events = [
+            data
+            for etype, data in events
+            if etype == "message_end" and data.get("message", {}).get("role") == "user"
+        ]
+        advisory_frames = [
+            data for data in message_end_events if ADVISORY_TAG_OPEN in data["message"]["content"]
+        ]
+        assert len(advisory_frames) == 1
+
+        # -- it appears before the next (third) provider request's events,
+        #    not folded into the request that crossed the threshold --------
+        assert len(provider1.calls) == 3
+        third_request_messages = provider1.calls[2][2]
+        assert any(
+            isinstance(m, UserMessage) and ADVISORY_TAG_OPEN in m.text
+            for m in third_request_messages
+        )
+        second_request_messages = provider1.calls[1][2]
+        assert not any(
+            isinstance(m, UserMessage) and ADVISORY_TAG_OPEN in m.text
+            for m in second_request_messages
+        )
+
+        # -- it is also present in the durable entry log --------------------
+        pre_restart_entries = SessionStore(db_path).entries(session_id)
+        message_entries = [e for e in pre_restart_entries if e.type == ENTRY_TYPE_MESSAGE]
+        logged_advisories = [
+            m
+            for m in (entry_to_message(e) for e in message_entries)
+            if isinstance(m, UserMessage) and ADVISORY_TAG_OPEN in m.text
+        ]
+        assert len(logged_advisories) == 1
+
+        pre_restart_derived = derive_state(pre_restart_entries)
+        pre_restart_positions = [
+            i
+            for i, m in enumerate(pre_restart_derived.messages)
+            if isinstance(m, UserMessage) and ADVISORY_TAG_OPEN in m.text
+        ]
+        assert len(pre_restart_positions) == 1
+
+    # -- simulated restart: fresh app + store over the same sqlite file ----
+    app1.state.knot.store.close()
+    fleet2 = compile_fleet(tmp_path)
+    store2 = SessionStore(db_path)
+    provider2 = FakeProvider([reply("still here after resume")])
+    app2 = create_app(
+        fleet=fleet2,
+        store=store2,
+        provider=provider2,
+        runtime_kwargs={"invariant_mode": "strict"},
+    )
+
+    async with client_for(app2) as client2:
+        got = await client2.get(f"/sessions/{session_id}")
+        assert got.status_code == 200
+        assert got.json()["state"] == "idle"
+
+        # -- history integrity across the restart: the resumed session's
+        #    derived history is identical, and the advisory is still at the
+        #    same position it held before the restart -------------------
+        resumed_derived = derive_state(store2.entries(session_id))
+        assert [(m.role, m.text) for m in resumed_derived.messages] == [
+            (m.role, m.text) for m in pre_restart_derived.messages
+        ]
+        resumed_positions = [
+            i
+            for i, m in enumerate(resumed_derived.messages)
+            if isinstance(m, UserMessage) and ADVISORY_TAG_OPEN in m.text
+        ]
+        assert resumed_positions == pre_restart_positions
+
+        cont = await client2.post(f"/sessions/{session_id}/messages", json={"text": "one more"})
+        assert cont.status_code == 200
+        cont_events = parse_sse(cont.text)
+        assert cont_events[-1][1]["outcome"] == "completed"

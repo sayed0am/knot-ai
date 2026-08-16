@@ -17,11 +17,12 @@ from authoring_fixtures import write_files
 from knot.authoring.compile import compile_fleet
 from knot.authoring.runtime import AgentRuntime
 from knot.core.events import AgentEndEvent, SubagentCalledEvent, SubagentCompletedEvent
+from knot.core.repeat_guard import ADVISORY_TAG_OPEN
 from knot.core.session.persistence import PersistenceSubscriber
 from knot.core.session.queries import child_chain
 from knot.core.session.state import derive_state
 from knot.core.tools import AgentTool, AgentToolResult
-from knot.providers.fake import FakeProvider, error, reply
+from knot.providers.fake import FakeProvider, error, reply, tool_call
 from knot.providers.messages import ToolCall, ToolResultMessage, UserMessage
 
 
@@ -651,4 +652,86 @@ async def test_runtime_warn_mode_logs_divergence_and_continues_on_memory_only_ap
     warnings = [r for r in caplog.records if "invariant diverged" in r.getMessage()]
     assert len(warnings) == 1
     assert "memory_extra" in warnings[0].getMessage()
+    store.close()
+
+
+# ---------------------------------------------------------------------------
+# Repeat-tool-call guard (task 5.1): a persisted session whose advisory rode
+# the steering append+emit path (see knot.core.loop, knot.core.repeat_guard)
+# must rehydrate with that advisory in the exact same position the live
+# harness saw it -- proving the advisory is ordinary durable history, not
+# just a live-run artifact. Chain detection and advisory content are already
+# covered at the unit level (tests/test_core_repeat_guard.py) and the loop
+# level (tests/test_core_loop.py); this is the persistence/replay proof.
+# ---------------------------------------------------------------------------
+
+
+async def test_repeat_guard_advisory_survives_derive_state_at_the_same_position(
+    tmp_path: Path,
+) -> None:
+    write_files(
+        tmp_path,
+        {
+            "agents/root/instructions.md": "you are root\n",
+            "agents/root/agent.yaml": "repeat_guard:\n  thresholds: [2]\n",
+            "agents/root/tools/search.py": """
+                from knot.authoring.tools import tool
+
+
+                @tool
+                def search(q: str) -> str:
+                    \"\"\"Search for something.\"\"\"
+                    return f"result:{q}"
+            """,
+        },
+    )
+    fleet = compile_fleet(tmp_path)
+    assert fleet.agents["root"].ok is True
+
+    from knot.core.session.store import SessionStore
+
+    store = SessionStore(":memory:")
+    provider = FakeProvider(
+        [
+            tool_call("search", {"q": "cats"}, id="call_1"),
+            tool_call("search", {"q": "cats"}, id="call_2"),
+            reply("done"),
+        ]
+    )
+    runtime = AgentRuntime(fleet=fleet, store=store, provider=provider, invariant_mode="strict")
+    session = runtime.create_session("root")
+
+    harness = runtime.build_harness(session.session_id)
+    subscriber = PersistenceSubscriber(store, session.session_id)
+    harness.subscribe(subscriber)
+    try:
+        events = [event async for event in harness.prompt("find cats twice")]
+    finally:
+        subscriber.release()
+
+    end = events[-1]
+    assert isinstance(end, AgentEndEvent)
+    assert end.outcome == "completed"
+
+    live_messages = harness.messages
+    live_advisory_positions = [
+        i
+        for i, m in enumerate(live_messages)
+        if isinstance(m, UserMessage) and ADVISORY_TAG_OPEN in m.text
+    ]
+    assert len(live_advisory_positions) == 1
+
+    derived = derive_state(store.entries(session.session_id))
+    derived_advisory_positions = [
+        i
+        for i, m in enumerate(derived.messages)
+        if isinstance(m, UserMessage) and ADVISORY_TAG_OPEN in m.text
+    ]
+    assert len(derived_advisory_positions) == 1
+
+    # Same tail shape either way: the live harness's full history and the
+    # rehydrated (derive_state) history agree on (role, text) throughout,
+    # so the advisory necessarily lands at the same position in both.
+    assert [(m.role, m.text) for m in derived.messages] == [(m.role, m.text) for m in live_messages]
+    assert derived_advisory_positions == live_advisory_positions
     store.close()

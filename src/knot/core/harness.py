@@ -27,6 +27,7 @@ from knot.core.events import (
     PendingInputRequest,
 )
 from knot.core.loop import run_agent_loop
+from knot.core.repeat_guard import RepeatGuardSettings
 from knot.core.tool_history import INTERRUPTED_TOOL_RESULT
 from knot.core.tools import AgentTool
 from knot.core.truncation import SpillSink
@@ -69,6 +70,7 @@ class AgentHarnessConfig:
     default_question_ttl_seconds: int | None = None
     pre_request_hook: Callable[[Sequence[AgentMessage]], Awaitable[None]] | None = None
     pre_turn_hook: Callable[[list[AgentMessage]], Awaitable[Sequence[AgentEvent]]] | None = None
+    repeat_guard: RepeatGuardSettings | None = None
 
 
 class AgentHarness:
@@ -245,6 +247,7 @@ class AgentHarness:
                 default_question_ttl_seconds=self._config.default_question_ttl_seconds,
                 pre_request_hook=self._config.pre_request_hook,
                 pre_turn_hook=self._config.pre_turn_hook,
+                repeat_guard=self._config.repeat_guard,
             ):
                 if isinstance(event, AgentEndEvent):
                     self._pending_requests = (

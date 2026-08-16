@@ -112,6 +112,47 @@ class CompactionConfig(WireModel):
         return self
 
 
+class RepeatGuardConfig(WireModel):
+    """Embedded verbatim into ``AgentManifest.repeat_guard``; see
+    ``ModelConfig`` for why this is a ``WireModel``.
+
+    Defaults enable the guard with no configuration at all (spec: "The
+    guard SHALL be enabled by default with the default thresholds").
+    ``thresholds`` is normalized ascending on the way in so
+    ``knot.core.repeat_guard.RepeatChain`` can trust ``thresholds[0]`` is
+    the lowest (the "first threshold" boundary between the short generic
+    nudge and the detailed later-threshold advisory).
+    """
+
+    enabled: bool = True
+    thresholds: list[int] = Field(default_factory=lambda: [3, 5, 8])
+    exclude: list[str] = Field(default_factory=lambda: ["ask_user", "load_skill"])
+    preview_cap: int = 500
+
+    @field_validator("thresholds")
+    @classmethod
+    def _thresholds_valid(cls, value: list[int]) -> list[int]:
+        if not value:
+            raise ValueError("repeat_guard.thresholds must not be empty")
+        for item in value:
+            if isinstance(item, bool) or not isinstance(item, int):
+                raise ValueError(
+                    f"repeat_guard.thresholds must contain only integers, got {item!r}"
+                )
+            if item < 2:
+                raise ValueError(f"repeat_guard.thresholds values must be >= 2, got {item}")
+        if len(set(value)) != len(value):
+            raise ValueError("repeat_guard.thresholds must not contain duplicates")
+        return sorted(value)
+
+    @field_validator("preview_cap")
+    @classmethod
+    def _preview_cap_positive(cls, value: int) -> int:
+        if value <= 0:
+            raise ValueError("repeat_guard.preview_cap must be a positive integer")
+        return value
+
+
 class LimitsConfig(WireModel):
     """Embedded verbatim into ``AgentManifest.limits``; see ``ModelConfig``
     for why this is a ``WireModel``."""
@@ -130,6 +171,7 @@ class AgentConfig(_StrictModel):
     model: ModelConfig | None = None
     limits: LimitsConfig = Field(default_factory=LimitsConfig)
     compaction: CompactionConfig = Field(default_factory=CompactionConfig)
+    repeat_guard: RepeatGuardConfig = Field(default_factory=RepeatGuardConfig)
     use: list[str] = Field(default_factory=list)
     approvals: dict[str, ApprovalPolicyName] = Field(default_factory=dict)
 
@@ -257,6 +299,7 @@ __all__ = [
     "ConnectionConfig",
     "LimitsConfig",
     "ModelConfig",
+    "RepeatGuardConfig",
     "load_agent_config",
     "load_bundle_config",
 ]

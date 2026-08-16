@@ -186,7 +186,11 @@ def test_derive_state_folds_compaction_into_summary_plus_tail() -> None:
 
         assert len(state.messages) == 2
         assert state.messages[0] == summary
-        assert state.messages[1] == UserMessage(content="three (tail)")
+        # Content comparison, not model equality: a freshly constructed
+        # UserMessage gets a new millisecond timestamp and would only
+        # match the rehydrated one by luck.
+        assert isinstance(state.messages[1], UserMessage)
+        assert state.messages[1].text == "three (tail)"
 
 
 def test_derive_state_repeated_compactions_compose() -> None:
@@ -226,7 +230,11 @@ def test_derive_state_repeated_compactions_compose() -> None:
 
         assert len(state.messages) == 2
         assert state.messages[0] == second_summary
-        assert state.messages[1] == UserMessage(content="three (tail)")
+        # Content comparison, not model equality: a freshly constructed
+        # UserMessage gets a new millisecond timestamp and would only
+        # match the rehydrated one by luck.
+        assert isinstance(state.messages[1], UserMessage)
+        assert state.messages[1].text == "three (tail)"
 
 
 def test_derive_state_compaction_interleaved_with_park_leaves_pending_derivation_untouched() -> (

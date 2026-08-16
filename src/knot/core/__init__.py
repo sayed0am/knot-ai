@@ -70,6 +70,16 @@ from knot.core.invariant import (
     diff_histories,
 )
 from knot.core.loop import run_agent_loop
+from knot.core.repeat_guard import (
+    ADVISORY_TAG_CLOSE,
+    ADVISORY_TAG_OPEN,
+    FIRST_REMINDER,
+    RepeatChain,
+    RepeatGuardSettings,
+    build_advisory,
+    canonical_key,
+    is_excluded,
+)
 from knot.core.session import (
     ENTRY_TYPE_INPUT_REQUESTED,
     ENTRY_TYPE_INPUT_RESOLVED,

@@ -81,6 +81,7 @@ from knot.core.hitl.policies import build_decision_hook
 from knot.core.hitl.resume import is_ready_to_continue, write_child_completion
 from knot.core.invariant import InvariantMode, build_invariant_hook
 from knot.core.loop import emit_loop_event
+from knot.core.repeat_guard import RepeatGuardSettings
 from knot.core.session.entries import ENTRY_TYPE_COMPACTION, Compaction
 from knot.core.session.persistence import PersistenceSubscriber
 from knot.core.session.state import DerivedState, derive_state, harness_from_session, rehydrate
@@ -216,6 +217,16 @@ def _compaction_settings(manifest: AgentManifest) -> CompactionSettings:
         summarization_model=cfg.summarization_model,
         max_overflow_retries=cfg.max_overflow_retries,
         summarization_max_tokens=cfg.summarization_max_tokens,
+    )
+
+
+def _repeat_guard_settings(manifest: AgentManifest) -> RepeatGuardSettings:
+    cfg = manifest.repeat_guard
+    return RepeatGuardSettings(
+        enabled=cfg.enabled,
+        thresholds=tuple(cfg.thresholds),
+        exclude=tuple(cfg.exclude),
+        preview_cap=cfg.preview_cap,
     )
 
 
@@ -487,6 +498,7 @@ class AgentRuntime:
             pre_request_hook=invariant_hook,
             pre_turn_hook=pre_turn_hook,
             spill_sink=self.build_spill_sink(session_id),
+            repeat_guard=_repeat_guard_settings(manifest),
         )
         harness = harness_from_session(self.store, session_id, config)
         if delegation_tools:
