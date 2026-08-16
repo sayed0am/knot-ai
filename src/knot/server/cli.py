@@ -10,14 +10,53 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import os
 import sys
+from collections.abc import Mapping
 from pathlib import Path
 
 from knot.authoring.compile import compile_fleet
 from knot.authoring.connections import format_refresh_report, refresh_snapshots
 from knot.authoring.validate import format_report, run_validate
+from knot.core.invariant import InvariantMode
 from knot.core.session import SessionStore, export_session_jsonl
 from knot.server.app import create_app
+
+#: See ``resolve_invariant_mode``. Named for the setting it overrides, not
+#: for "knot" generically, since more env-overridable settings may follow.
+INVARIANT_MODE_ENV_VAR = "KNOT_INVARIANT_MODE"
+
+_INVARIANT_MODES: tuple[InvariantMode, ...] = ("strict", "warn", "off")
+
+#: The serving default (see design.md D3): a false positive in production
+#: must degrade to telemetry, not an outage. Test fixtures pass "strict"
+#: explicitly instead of relying on this constant — it names only the
+#: ``knot serve`` default.
+DEFAULT_SERVING_INVARIANT_MODE: InvariantMode = "warn"
+
+
+def resolve_invariant_mode(
+    explicit: str | None, *, env: Mapping[str, str] | None = None
+) -> InvariantMode:
+    """Resolve the effective ``invariant_mode`` for ``knot serve``.
+
+    Precedence: an explicit value (the ``--invariant-mode`` flag) wins
+    outright over ``$KNOT_INVARIANT_MODE``, which in turn wins over the
+    serving default ``"warn"``. An unrecognized value from either source is
+    a startup ``ValueError`` — never a silent fallback to the default, since
+    that would quietly demote a deliberately-configured safety check (e.g. a
+    typo'd env var meant to set "strict") to warn without telling anyone.
+    """
+    resolved_env = env if env is not None else os.environ
+    candidate = explicit if explicit is not None else resolved_env.get(INVARIANT_MODE_ENV_VAR)
+    if candidate is None:
+        return DEFAULT_SERVING_INVARIANT_MODE
+    if candidate not in _INVARIANT_MODES:
+        source = "--invariant-mode" if explicit is not None else INVARIANT_MODE_ENV_VAR
+        raise ValueError(
+            f"invalid {source} value {candidate!r}: must be one of {', '.join(_INVARIANT_MODES)}"
+        )
+    return candidate  # type: ignore[return-value]  # validated against _INVARIANT_MODES above
 
 
 def _cmd_export(args: argparse.Namespace) -> int:
@@ -69,6 +108,12 @@ def _cmd_serve(args: argparse.Namespace) -> int:
         )
         return 1
 
+    try:
+        invariant_mode = resolve_invariant_mode(args.invariant_mode)
+    except ValueError as exc:
+        print(f"knot: {exc}", file=sys.stderr)
+        return 1
+
     # v0.1 provider policy: 'serve' talks to every session, parent and
     # descendant subagent alike, through one Anthropic provider instance
     # (an agent's own manifest 'model.name' still selects which model that
@@ -78,7 +123,12 @@ def _cmd_serve(args: argparse.Namespace) -> int:
 
     store = SessionStore(args.db)
     provider = AnthropicProvider()
-    app = create_app(fleet=fleet, store=store, provider=provider)
+    app = create_app(
+        fleet=fleet,
+        store=store,
+        provider=provider,
+        runtime_kwargs={"invariant_mode": invariant_mode},
+    )
 
     import uvicorn
 
@@ -135,6 +185,16 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Start even if one or more agents failed to compile",
     )
+    serve_parser.add_argument(
+        "--invariant-mode",
+        choices=_INVARIANT_MODES,
+        default=None,
+        help=(
+            "Model-visible-logged invariant enforcement: 'strict' fails a run on "
+            "divergence, 'warn' logs and continues, 'off' disables the check. "
+            f"Defaults to ${INVARIANT_MODE_ENV_VAR} if set, else 'warn'."
+        ),
+    )
     serve_parser.set_defaults(handler=_cmd_serve)
 
     return parser
@@ -150,4 +210,4 @@ if __name__ == "__main__":
     raise SystemExit(main())
 
 
-__all__ = ["build_parser", "main"]
+__all__ = ["build_parser", "main", "resolve_invariant_mode"]

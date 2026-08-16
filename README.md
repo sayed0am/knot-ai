@@ -87,6 +87,9 @@ chain with a child approval, and restart recovery mid-park.
 - [Skills](docs/skills.md) — the `SKILL.md` format and `load_skill`.
 - [HTTP API](docs/http-api.md) — every endpoint, the SSE wire protocol, and
   the turn/park/delegation state machine, for frontend integration.
+- [Invariants](docs/invariants.md) — cross-cutting design rules for
+  contributors to knot itself, starting with the model-visible-logged
+  invariant and its `--invariant-mode` setting.
 - [`examples/fleet`](examples/fleet) — a complete, working example fleet
   (a support-triage agent, a researcher subagent, and a shared CRM bundle)
   demonstrating every feature the docs above describe; validate it with

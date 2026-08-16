@@ -12,6 +12,7 @@ from knot.core.events import (
     PendingInputRequest,
     ToolExecutionEndEvent,
 )
+from knot.core.invariant import DivergenceReport, HistoryDivergenceError
 from knot.core.loop import run_agent_loop
 from knot.core.tool_history import repair_tool_history
 from knot.core.tools import AgentTool, AgentToolResult, ToolParkedError
@@ -472,6 +473,122 @@ async def test_provider_aborted_ends_run_with_aborted_outcome() -> None:
     end = events[-1]
     assert isinstance(end, AgentEndEvent)
     assert end.outcome == "aborted"
+
+
+async def test_pre_request_hook_fires_once_per_provider_request() -> None:
+    provider = FakeProvider([tool_call("get_invoice", {}), reply("done")])
+    tool = _echo_tool("get_invoice")
+    seen: list[list] = []
+
+    async def hook(messages) -> None:
+        seen.append(list(messages))
+
+    events = await _collect(
+        provider=provider,
+        model="m",
+        system="s",
+        messages=[],
+        tools=[tool],
+        prompts=[UserMessage(content="go")],
+        pre_request_hook=hook,
+    )
+
+    end = events[-1]
+    assert isinstance(end, AgentEndEvent)
+    assert end.outcome == "completed"
+    # One call to the hook per provider request (two turns -> two requests).
+    assert len(seen) == 2 == len(provider.calls)
+    # The hook sees the exact message list the request is built from: the
+    # second call's snapshot must already include the first turn's results.
+    assert any(isinstance(m, ToolResultMessage) for m in seen[1])
+
+
+async def test_pre_request_hook_none_leaves_run_unchanged() -> None:
+    provider = FakeProvider([reply("hello there")])
+
+    events = await _collect(
+        provider=provider,
+        model="m",
+        system="s",
+        messages=[],
+        tools=[],
+        prompts=[UserMessage(content="hi")],
+        pre_request_hook=None,
+    )
+
+    end = events[-1]
+    assert isinstance(end, AgentEndEvent)
+    assert end.outcome == "completed"
+
+
+async def test_pre_request_hook_strict_divergence_ends_run_with_error_and_no_provider_call() -> (
+    None
+):
+    provider = FakeProvider([reply("hello there")])
+    report = DivergenceReport(
+        index=0, entry_seq=None, kind="memory_extra", summary="synthetic test divergence"
+    )
+
+    async def hook(messages) -> None:
+        raise HistoryDivergenceError(report)
+
+    events = await _collect(
+        provider=provider,
+        model="m",
+        system="s",
+        messages=[],
+        tools=[],
+        prompts=[UserMessage(content="hi")],
+        pre_request_hook=hook,
+    )
+
+    end = events[-1]
+    assert isinstance(end, AgentEndEvent)
+    assert end.outcome == "error"
+    assert len(provider.calls) == 0
+    assert any(
+        isinstance(e, MessageEndEvent)
+        and isinstance(e.message, AssistantMessage)
+        and e.message.stop_reason == "error"
+        and "synthetic test divergence" in (e.message.error_message or "")
+        for e in events
+    )
+
+
+async def test_pre_request_hook_strict_divergence_mid_run_stops_further_provider_calls() -> None:
+    """Divergence detected before the *second* request must stop the run
+    with zero further provider calls after that point -- the first call
+    (before divergence was introduced) is allowed to have already happened.
+    """
+    provider = FakeProvider([tool_call("get_invoice", {}), reply("unreachable")])
+    tool = _echo_tool("get_invoice")
+    calls_before_hook_raises = 0
+
+    async def hook(messages) -> None:
+        nonlocal calls_before_hook_raises
+        calls_before_hook_raises += 1
+        if calls_before_hook_raises == 2:
+            raise HistoryDivergenceError(
+                DivergenceReport(
+                    index=0, entry_seq=None, kind="memory_extra", summary="diverged on turn 2"
+                )
+            )
+
+    events = await _collect(
+        provider=provider,
+        model="m",
+        system="s",
+        messages=[],
+        tools=[tool],
+        prompts=[UserMessage(content="go")],
+        pre_request_hook=hook,
+    )
+
+    end = events[-1]
+    assert isinstance(end, AgentEndEvent)
+    assert end.outcome == "error"
+    assert len(provider.calls) == 1  # the second provider call never happened
+    assert calls_before_hook_raises == 2
 
 
 async def test_cancel_mid_tool_ends_aborted_and_history_is_rehydratable() -> None:

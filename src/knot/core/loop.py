@@ -25,7 +25,7 @@ from __future__ import annotations
 
 import asyncio
 import uuid
-from collections.abc import AsyncIterator, Callable, Mapping, Sequence
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from contextlib import suppress
 from contextvars import ContextVar
 from dataclasses import dataclass
@@ -45,6 +45,7 @@ from knot.core.events import (
     TurnEndEvent,
     TurnStartEvent,
 )
+from knot.core.invariant import HistoryDivergenceError
 from knot.core.tool_history import provider_context
 from knot.core.tools import AgentTool, AgentToolResult, ToolParkedError, execute_tool
 from knot.providers.events import (
@@ -112,6 +113,7 @@ async def run_agent_loop(
     tool_decision_hook: ToolDecisionHook | None = None,
     max_result_bytes: int | None = None,
     default_question_ttl_seconds: int | None = None,
+    pre_request_hook: Callable[[Sequence[AgentMessage]], Awaitable[None]] | None = None,
 ) -> AsyncIterator[AgentEvent]:
     """Run the provider/tool loop, emitting the core agent event grammar.
 
@@ -120,6 +122,14 @@ async def run_agent_loop(
     default) means such requests never expire on their own. A
     ``tool_approval`` park's ttl instead comes from the decision hook's
     ``RequireApproval(ttl_seconds=...)``, per call.
+
+    ``pre_request_hook``, when given, is awaited exactly once immediately
+    before each provider request, with the exact ``messages`` list that
+    request is about to be built from (``knot.core.invariant`` installs the
+    model-visible-logged invariant check here). A raised
+    ``HistoryDivergenceError`` is treated like any other fatal turn error:
+    it ends the run through the same error-outcome path, before any
+    provider call is made — no new outcome kind.
     """
     new_messages = list(prompts)
     if prompts:
@@ -170,6 +180,14 @@ async def run_agent_loop(
                 ):
                     yield event
                 return
+
+            if pre_request_hook is not None:
+                try:
+                    await pre_request_hook(messages)
+                except HistoryDivergenceError as exc:
+                    async for event in _end_with_error(model, str(exc), messages, new_messages):
+                        yield event
+                    return
 
             # Python async generators cannot pass a yielding callback through a
             # normal await cleanly, so consume the assistant sub-generator and

@@ -68,6 +68,7 @@ from knot.core.events import (
 from knot.core.harness import AgentHarness, AgentHarnessConfig
 from knot.core.hitl.policies import build_decision_hook
 from knot.core.hitl.resume import is_ready_to_continue, write_child_completion
+from knot.core.invariant import InvariantMode, build_invariant_hook
 from knot.core.loop import emit_loop_event
 from knot.core.session.persistence import PersistenceSubscriber
 from knot.core.session.state import DerivedState, harness_from_session, rehydrate
@@ -198,6 +199,7 @@ class AgentRuntime:
         token_resolver: TokenResolver = default_token_resolver,
         provided_argument_resolver: ProvidedArgumentResolver | None = None,
         principal: str = DEFAULT_PRINCIPAL,
+        invariant_mode: InvariantMode = "warn",
     ) -> None:
         self.fleet = fleet
         self.store = store
@@ -212,6 +214,11 @@ class AgentRuntime:
         self.token_resolver = token_resolver
         self.provided_argument_resolver = provided_argument_resolver
         self.principal = principal
+        #: Serving default is "warn" (see design.md D3); ``knot serve`` and
+        #: test fixtures each pass their own value explicitly rather than
+        #: relying on this default — production degrades a false positive
+        #: to telemetry, tests ratchet on strict.
+        self.invariant_mode = invariant_mode
 
     # -- session identity --------------------------------------------------
 
@@ -320,6 +327,16 @@ class AgentRuntime:
             else self.max_result_bytes
         )
 
+        # Every harness this method builds is store-backed by construction
+        # (``harness_from_session`` below), so it always gets the
+        # model-visible-logged invariant hook — "off" makes
+        # ``build_invariant_hook`` return ``None``, the loop's ordinary
+        # no-op path, at no extra cost. A caller that wants a bare,
+        # hook-free harness (tests, library use with no store) constructs
+        # ``AgentHarness``/``AgentHarnessConfig`` directly and never comes
+        # through here.
+        invariant_hook = build_invariant_hook(self.store, session_id, self.invariant_mode)
+
         config = AgentHarnessConfig(
             provider=self.provider,
             model=model_name,
@@ -329,6 +346,7 @@ class AgentRuntime:
             tool_decision_hook=hook,
             max_turns=manifest.limits.max_turns,
             max_result_bytes=max_result_bytes,
+            pre_request_hook=invariant_hook,
         )
         harness = harness_from_session(self.store, session_id, config)
         if delegation_tools:

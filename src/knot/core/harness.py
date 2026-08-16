@@ -65,6 +65,7 @@ class AgentHarnessConfig:
     tool_decision_hook: ToolDecisionHook | None = None
     max_result_bytes: int | None = None
     default_question_ttl_seconds: int | None = None
+    pre_request_hook: Callable[[Sequence[AgentMessage]], Awaitable[None]] | None = None
 
 
 class AgentHarness:
@@ -238,6 +239,7 @@ class AgentHarness:
                 tool_decision_hook=self._config.tool_decision_hook,
                 max_result_bytes=self._config.max_result_bytes,
                 default_question_ttl_seconds=self._config.default_question_ttl_seconds,
+                pre_request_hook=self._config.pre_request_hook,
             ):
                 if isinstance(event, AgentEndEvent):
                     self._pending_requests = (

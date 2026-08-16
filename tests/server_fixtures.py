@@ -37,7 +37,21 @@ def make_app(
     fleet = compile_fleet(tmp_path)
     store = SessionStore(db_path)
     resolved_provider = provider if provider is not None else FakeProvider(scripts)
-    return create_app(fleet=fleet, store=store, provider=resolved_provider, **create_app_kwargs)
+    # Test/validation harnesses default to "strict" (design.md D3, spec
+    # "Enforcement modes"): every scenario driven through this helper runs
+    # under the model-visible-logged invariant unless a caller explicitly
+    # asks for something else via runtime_kwargs. The *serving* default
+    # stays "warn" (see knot.server.cli.resolve_invariant_mode) — this is
+    # deliberately a different default, scoped to tests only.
+    runtime_kwargs = dict(create_app_kwargs.pop("runtime_kwargs", None) or {})
+    runtime_kwargs.setdefault("invariant_mode", "strict")
+    return create_app(
+        fleet=fleet,
+        store=store,
+        provider=resolved_provider,
+        runtime_kwargs=runtime_kwargs,
+        **create_app_kwargs,
+    )
 
 
 def state_of(app: FastAPI) -> ServerState:

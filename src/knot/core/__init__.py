@@ -50,6 +50,16 @@ from knot.core.hitl import (
     repair_crash_windows,
     resolve_inputs,
 )
+from knot.core.invariant import (
+    PROVIDER_INVISIBLE_FIELDS,
+    DivergenceKind,
+    DivergenceReport,
+    HistoryDivergenceError,
+    InvariantMode,
+    build_invariant_hook,
+    canonical_history,
+    diff_histories,
+)
 from knot.core.loop import run_agent_loop
 from knot.core.session import (
     ENTRY_TYPE_INPUT_REQUESTED,

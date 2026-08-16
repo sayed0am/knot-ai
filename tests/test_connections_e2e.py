@@ -77,7 +77,13 @@ async def test_agent_calls_connection_tool_through_the_real_pool(tmp_path: Path)
             ]
         )
         pool = ConnectionPool(transport_factory=tf)
-        runtime = AgentRuntime(fleet=fleet, store=store, provider=provider, connection_pool=pool)
+        runtime = AgentRuntime(
+            fleet=fleet,
+            store=store,
+            provider=provider,
+            connection_pool=pool,
+            invariant_mode="strict",
+        )
         session = runtime.create_session("root")
 
         events = [event async for event in runtime.run_turn(session.session_id, "ping crm")]
@@ -86,9 +92,7 @@ async def test_agent_calls_connection_tool_through_the_real_pool(tmp_path: Path)
         assert end.outcome == "completed"
         assert end.messages[-1].text == "the crm said: hello crm"
 
-        tool_result = next(
-            m for m in end.messages if getattr(m, "tool_call_id", None) == "c1"
-        )
+        tool_result = next(m for m in end.messages if getattr(m, "tool_call_id", None) == "c1")
         assert tool_result.is_error is False
         assert tool_result.text == "hello crm"
         assert len(handle.calls) == 1
@@ -118,7 +122,13 @@ async def test_unknown_connection_tool_is_rejected_with_no_network_attempt(tmp_p
             ]
         )
         pool = ConnectionPool(transport_factory=tf)
-        runtime = AgentRuntime(fleet=fleet, store=store, provider=provider, connection_pool=pool)
+        runtime = AgentRuntime(
+            fleet=fleet,
+            store=store,
+            provider=provider,
+            connection_pool=pool,
+            invariant_mode="strict",
+        )
         session = runtime.create_session("root")
 
         events = [event async for event in runtime.run_turn(session.session_id, "add 1 and 2")]
@@ -177,6 +187,7 @@ async def test_approval_gate_sees_only_model_arguments_then_executes_via_real_po
             provider=provider,
             connection_pool=pool,
             provided_argument_resolver=resolver,
+            invariant_mode="strict",
         )
         session = runtime.create_session("root")
 
@@ -228,7 +239,13 @@ async def test_park_leaves_no_open_connection_in_the_pool(tmp_path: Path) -> Non
             [reply(tool_calls=[ToolCall(id="c1", name="crm__echo", arguments={"message": "hi"})])]
         )
         pool = ConnectionPool(transport_factory=tf)
-        runtime = AgentRuntime(fleet=fleet, store=store, provider=provider, connection_pool=pool)
+        runtime = AgentRuntime(
+            fleet=fleet,
+            store=store,
+            provider=provider,
+            connection_pool=pool,
+            invariant_mode="strict",
+        )
         session = runtime.create_session("root")
 
         events = [event async for event in runtime.run_turn(session.session_id, "go")]
@@ -257,7 +274,12 @@ async def test_oversized_connection_result_is_truncated_by_max_result_bytes(
         )
         pool = ConnectionPool(transport_factory=tf)
         runtime = AgentRuntime(
-            fleet=fleet, store=store, provider=provider, connection_pool=pool, max_result_bytes=200
+            fleet=fleet,
+            store=store,
+            provider=provider,
+            connection_pool=pool,
+            max_result_bytes=200,
+            invariant_mode="strict",
         )
         session = runtime.create_session("root")
 
@@ -296,7 +318,13 @@ async def test_no_secrets_reach_durable_storage_or_events(
             ]
         )
         pool = ConnectionPool(transport_factory=tf)
-        runtime = AgentRuntime(fleet=fleet, store=store, provider=provider, connection_pool=pool)
+        runtime = AgentRuntime(
+            fleet=fleet,
+            store=store,
+            provider=provider,
+            connection_pool=pool,
+            invariant_mode="strict",
+        )
         session = runtime.create_session("root")
 
         events = [event async for event in runtime.run_turn(session.session_id, "go")]

@@ -9,6 +9,7 @@ bounding, cancellation cascade, child failure, and context isolation.
 from __future__ import annotations
 
 import asyncio
+import logging
 from pathlib import Path
 
 from authoring_fixtures import write_files
@@ -51,7 +52,7 @@ async def test_synchronous_delegation_completes_within_one_turn(tmp_path: Path) 
             reply("root says: 42"),
         ]
     )
-    runtime = AgentRuntime(fleet=fleet, store=store, provider=provider)
+    runtime = AgentRuntime(fleet=fleet, store=store, provider=provider, invariant_mode="strict")
     session = runtime.create_session("root")
 
     events = [event async for event in runtime.run_turn(session.session_id, "research x")]
@@ -87,7 +88,7 @@ async def test_delegation_emits_subagent_called_and_completed_control_events(
             reply("root says: 42"),
         ]
     )
-    runtime = AgentRuntime(fleet=fleet, store=store, provider=provider)
+    runtime = AgentRuntime(fleet=fleet, store=store, provider=provider, invariant_mode="strict")
     session = runtime.create_session("root")
 
     events = [event async for event in runtime.run_turn(session.session_id, "research x")]
@@ -127,7 +128,7 @@ async def test_delegation_cap_exceeded_produces_error_result_naming_the_cap(
         ToolCall(id="c2", name="researcher", arguments={"message": "b"}),
     ]
     provider = FakeProvider([reply(tool_calls=calls), reply("ok"), reply("done")])
-    runtime = AgentRuntime(fleet=fleet, store=store, provider=provider)
+    runtime = AgentRuntime(fleet=fleet, store=store, provider=provider, invariant_mode="strict")
     session = runtime.create_session("root")
 
     events = [event async for event in runtime.run_turn(session.session_id, "go")]
@@ -161,7 +162,7 @@ async def test_child_failure_produces_error_result_and_parent_turn_continues(
             reply("sorry, that failed, moving on"),
         ]
     )
-    runtime = AgentRuntime(fleet=fleet, store=store, provider=provider)
+    runtime = AgentRuntime(fleet=fleet, store=store, provider=provider, invariant_mode="strict")
     session = runtime.create_session("root")
 
     events = [event async for event in runtime.run_turn(session.session_id, "go")]
@@ -229,7 +230,7 @@ async def test_parallel_delegations_to_two_subagents_run_concurrently(tmp_path: 
             return gen2()
 
     provider = GatedProvider()
-    runtime = AgentRuntime(fleet=fleet, store=store, provider=provider)
+    runtime = AgentRuntime(fleet=fleet, store=store, provider=provider, invariant_mode="strict")
     session = runtime.create_session("root")
 
     async def drain() -> AgentEndEvent:
@@ -303,7 +304,7 @@ async def test_concurrency_semaphore_bounds_overlapping_delegations(tmp_path: Pa
             return gen2()
 
     provider = GatedProvider()
-    runtime = AgentRuntime(fleet=fleet, store=store, provider=provider)
+    runtime = AgentRuntime(fleet=fleet, store=store, provider=provider, invariant_mode="strict")
     session = runtime.create_session("root")
 
     async def drain() -> AgentEndEvent:
@@ -354,7 +355,7 @@ async def test_child_context_isolation_sees_only_its_own_system_and_message(
             reply("root reply"),
         ]
     )
-    runtime = AgentRuntime(fleet=fleet, store=store, provider=provider)
+    runtime = AgentRuntime(fleet=fleet, store=store, provider=provider, invariant_mode="strict")
     session = runtime.create_session("root")
 
     events = [event async for event in runtime.run_turn(session.session_id, "delegate please")]
@@ -403,7 +404,7 @@ async def test_cancellation_cascade_records_aborted_boundaries_in_both_sessions(
             reply(tool_calls=[ToolCall(id="c2", name="slow", arguments={})]),
         ]
     )
-    runtime = AgentRuntime(fleet=fleet, store=store, provider=provider)
+    runtime = AgentRuntime(fleet=fleet, store=store, provider=provider, invariant_mode="strict")
     session = runtime.create_session("root")
 
     # `run_turn` doesn't hand back the harness, so `build_harness` is used
@@ -438,4 +439,158 @@ async def test_cancellation_cascade_records_aborted_boundaries_in_both_sessions(
     assert child_result.tool_call_id == "c2"
     assert child_result.is_error is True
     assert "interrupted" in child_result.text.lower()
+    store.close()
+
+
+# ---------------------------------------------------------------------------
+# invariant hook wiring (assert-model-visible-logged stage 2, task 4.2):
+# every harness `_build_harness`/`build_harness` assembles is store-backed,
+# so it always carries a `pre_request_hook`; a plain `AgentHarness` built
+# directly (no runtime, no store) never does.
+# ---------------------------------------------------------------------------
+
+
+def test_build_harness_installs_the_invariant_hook_for_a_persisted_session(
+    tmp_path: Path,
+) -> None:
+    write_files(tmp_path, {"agents/root/instructions.md": "you are root\n"})
+    fleet = compile_fleet(tmp_path)
+    assert fleet.agents["root"].ok is True
+
+    from knot.core.session.store import SessionStore
+
+    store = SessionStore(":memory:")
+    provider = FakeProvider([reply("hi")])
+    runtime = AgentRuntime(fleet=fleet, store=store, provider=provider, invariant_mode="strict")
+    session = runtime.create_session("root")
+
+    harness = runtime.build_harness(session.session_id)
+    assert harness.config.pre_request_hook is not None
+    store.close()
+
+
+def test_build_harness_installs_no_hook_when_invariant_mode_is_off(tmp_path: Path) -> None:
+    write_files(tmp_path, {"agents/root/instructions.md": "you are root\n"})
+    fleet = compile_fleet(tmp_path)
+    assert fleet.agents["root"].ok is True
+
+    from knot.core.session.store import SessionStore
+
+    store = SessionStore(":memory:")
+    provider = FakeProvider([reply("hi")])
+    runtime = AgentRuntime(fleet=fleet, store=store, provider=provider, invariant_mode="off")
+    session = runtime.create_session("root")
+
+    harness = runtime.build_harness(session.session_id)
+    assert harness.config.pre_request_hook is None
+    store.close()
+
+
+def test_a_bare_agentharness_built_directly_has_no_invariant_hook() -> None:
+    """A harness constructed by hand — no ``AgentRuntime``, no store — is
+    exactly the "bare in-memory harness" the invariant spec exempts: nothing
+    installs a hook on it unless the caller explicitly passes one."""
+    from knot.core.harness import AgentHarness, AgentHarnessConfig
+
+    provider = FakeProvider([reply("hi")])
+    config = AgentHarnessConfig(provider=provider, model="default", system="you are root")
+    harness = AgentHarness(config)
+    assert harness.config.pre_request_hook is None
+
+
+# ---------------------------------------------------------------------------
+# integration regression (assert-model-visible-logged stage 5, task 5.1):
+# the unit tests in test_core_invariant.py and test_core_loop.py cover the
+# checker and the loop hook in isolation; this proves the wiring end-to-end
+# at the runtime level — a real persisted session, corrupted the way a bug
+# actually would (an in-memory-only append via ``harness.append_message``,
+# never reaching the durable log), caught before the next provider request.
+# ---------------------------------------------------------------------------
+
+
+async def test_runtime_strict_mode_fails_run_before_provider_call_on_memory_only_append(
+    tmp_path: Path,
+) -> None:
+    write_files(tmp_path, {"agents/root/instructions.md": "you are root\n"})
+    fleet = compile_fleet(tmp_path)
+    assert fleet.agents["root"].ok is True
+
+    from knot.core.session.store import SessionStore
+
+    store = SessionStore(":memory:")
+    provider = FakeProvider([reply("first turn done"), reply("should never be sent")])
+    runtime = AgentRuntime(fleet=fleet, store=store, provider=provider, invariant_mode="strict")
+    session = runtime.create_session("root")
+
+    # A normal, correctly-persisted first turn: baseline that the wiring
+    # itself doesn't false-positive.
+    events = [event async for event in runtime.run_turn(session.session_id, "hi")]
+    assert events[-1].outcome == "completed"
+    assert len(provider.calls) == 1
+
+    # Corrupt the *next* harness the same way a buggy code path would: an
+    # in-memory-only injection that never becomes a durable entry. The
+    # harness is rehydrated from the (uncorrupted) store, then we append
+    # directly to its in-memory history without going through persistence.
+    harness = runtime.build_harness(session.session_id)
+    harness.append_message(UserMessage(content="steered in memory, never persisted"))
+    subscriber = PersistenceSubscriber(store, session.session_id)
+    harness.subscribe(subscriber)
+    try:
+        end_events = [event async for event in harness.continue_()]
+    finally:
+        subscriber.release()
+
+    end = end_events[-1]
+    assert isinstance(end, AgentEndEvent)
+    assert end.outcome == "error"
+    assert "invariant" in (end.messages[-1].error_message or "").lower()
+
+    # The divergence was caught *before* the second provider request — the
+    # fake provider's call count is still exactly the one from the first,
+    # correctly-persisted turn.
+    assert len(provider.calls) == 1
+    store.close()
+
+
+async def test_runtime_warn_mode_logs_divergence_and_continues_on_memory_only_append(
+    tmp_path: Path, caplog
+) -> None:
+    write_files(tmp_path, {"agents/root/instructions.md": "you are root\n"})
+    fleet = compile_fleet(tmp_path)
+    assert fleet.agents["root"].ok is True
+
+    from knot.core.session.store import SessionStore
+
+    store = SessionStore(":memory:")
+    provider = FakeProvider([reply("first turn done"), reply("second turn done")])
+    runtime = AgentRuntime(fleet=fleet, store=store, provider=provider, invariant_mode="warn")
+    session = runtime.create_session("root")
+
+    events = [event async for event in runtime.run_turn(session.session_id, "hi")]
+    assert events[-1].outcome == "completed"
+    assert len(provider.calls) == 1
+
+    harness = runtime.build_harness(session.session_id)
+    harness.append_message(UserMessage(content="steered in memory, never persisted"))
+    subscriber = PersistenceSubscriber(store, session.session_id)
+    harness.subscribe(subscriber)
+    try:
+        with caplog.at_level(logging.WARNING, logger="knot.core.invariant"):
+            end_events = [event async for event in harness.continue_()]
+    finally:
+        subscriber.release()
+
+    end = end_events[-1]
+    assert isinstance(end, AgentEndEvent)
+    assert end.outcome == "completed"
+    assert end.messages[-1].text == "second turn done"
+
+    # The run proceeded, so the fake provider did receive the second
+    # request -- unlike strict mode, warn never vetoes the call.
+    assert len(provider.calls) == 2
+
+    warnings = [r for r in caplog.records if "invariant diverged" in r.getMessage()]
+    assert len(warnings) == 1
+    assert "memory_extra" in warnings[0].getMessage()
     store.close()
