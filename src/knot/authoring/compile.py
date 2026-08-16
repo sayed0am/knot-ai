@@ -43,6 +43,7 @@ from knot.authoring.manifest import AgentManifest, ManifestSkill, ManifestTool, 
 from knot.authoring.skills import Skill, build_load_skill_tool, parse_skill_file
 from knot.authoring.tools import compile_tool_module
 from knot.core.hitl import build_ask_user_tool
+from knot.core.spill_tool import build_read_tool_output_placeholder
 from knot.core.tools import AgentTool
 
 
@@ -608,6 +609,29 @@ def compile_agent(discovery: AgentDiscovery, fleet: FleetContext) -> CompiledAge
         )
     else:
         capabilities[ask_user_tool.name] = Capability(tool=ask_user_tool, source="builtin")
+
+    # read_tool_output is unconditional too (every spill needs it retrievable
+    # regardless of what tools an agent happens to have), but it compiles
+    # execute-less: it needs (store, session_id), which only exist at
+    # runtime assembly (see knot.authoring.runtime._build_harness).
+    read_tool_output_tool = build_read_tool_output_placeholder()
+    if read_tool_output_tool.name in capabilities:
+        existing = capabilities[read_tool_output_tool.name]
+        diagnostics.append(
+            Diagnostic(
+                severity="error",
+                path=discovery.path,
+                message=(
+                    f"tool name collision on {read_tool_output_tool.name!r}: defined by both "
+                    f"{existing.source!r} and 'builtin' (framework-floor tool)"
+                ),
+                agent_id=discovery.agent_id,
+            )
+        )
+    else:
+        capabilities[read_tool_output_tool.name] = Capability(
+            tool=read_tool_output_tool, source="builtin"
+        )
 
     if skills:
         load_skill_tool = build_load_skill_tool(list(skills.values()))

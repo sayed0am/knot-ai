@@ -67,7 +67,7 @@ approvals:
 | `model.name` | `str` | — (required if `model:` is present) | The model name/id passed to the provider. |
 | `model.max_tokens` | `int \| null` | `null` | Passed through to the provider on every call. |
 | `limits.max_turns` | `int \| null` | `null` (unlimited) | Maximum number of assistant turns before the run stops. |
-| `limits.max_result_bytes` | `int \| null` | `null` | Caps a tool result's serialized size; oversized results are truncated. |
+| `limits.max_result_bytes` | `int \| null` | `null` | Caps a tool result's serialized size; an oversized result is spilled — replaced with a bounded preview plus a retrieval notice — with truncation as the fallback. See [Oversized tool results (spill)](#oversized-tool-results-spill) below. |
 | `limits.delegation_max_per_turn` | `int` | `4` | How many delegation (subagent) calls this agent may make in a single turn; exceeding it fails the delegation call with an error instead of running it. |
 | `limits.delegation_max_concurrent` | `int` | `2` | How many delegation calls may be in flight at once, enforced by a semaphore. |
 | `use` | `list[str]` | `[]` | Bundle ids (directory names under `shared/`) whose tools, skills, and approvals this agent pulls in. See [`docs/bundles.md`](bundles.md). |
@@ -152,10 +152,57 @@ anything:
   synchronously (kind `child_session`) — otherwise it returns the child's
   answer directly, in the same turn.
 
-Every compiled agent also automatically gets `ask_user` (always) and, iff it
-has at least one skill, `load_skill` (see [`docs/skills.md`](skills.md)) —
-these are the "framework floor": tools present without being authored, and
-subject to the same name-collision check as everything else.
+Every compiled agent also automatically gets `ask_user` (always),
+`read_tool_output` (always — see [Oversized tool results (spill)](#oversized-tool-results-spill)
+below), and, iff it has at least one skill, `load_skill` (see
+[`docs/skills.md`](skills.md)) — these are the "framework floor": tools
+present without being authored, and subject to the same name-collision
+check as everything else.
+
+## Oversized tool results (spill)
+
+When a tool's result text exceeds `limits.max_result_bytes`, knot doesn't
+drop the excess — it *spills* it. The model-facing result is replaced with
+a bounded head/tail preview of the original text plus a short notice naming
+how many bytes were omitted and how to retrieve them; the full original
+text is stored durably, keyed to the tool call that produced it, and stays
+retrievable across a process restart for as long as the session exists
+(removed with it). Results within the cap, and results with no text content
+(e.g. images), pass through unchanged.
+
+Every compiled agent automatically gets the `read_tool_output` tool
+(framework floor, alongside `ask_user`) to retrieve spilled content:
+
+```
+read_tool_output(ref, offsetBytes?, limitBytes?, pattern?)
+```
+
+- **`ref`** — the retrieval reference named in the spill notice (the
+  originating tool call's own id).
+- **`offsetBytes` / `limitBytes`** — page through the stored text as a raw
+  byte slice; `limitBytes` is clamped to a hard ceiling (16KB by default).
+- **`pattern`** — search the stored text with a Python regular expression
+  instead of paging; returns up to 20 matches, each with a byte offset and
+  a small context window, so a match can be paged to directly with a
+  follow-up `offsetBytes` call.
+- An unknown `ref` (not one from this session) returns an ordinary error
+  result naming the ref — never an unhandled exception.
+
+`read_tool_output`'s own results are never themselves spilled — its output
+is already bounded by its paging parameters, so there's no
+spill-retrieve-spill loop.
+
+If storing the spilled content fails, or if even a notice-only replacement
+can't fit within `max_result_bytes`, knot falls back to the older,
+destructive truncation behavior for that one result (a warning is logged on
+a storage failure) — a spill-storage failure never turns a successful tool
+call into an error.
+
+**Authoring note**: there is currently no author-facing way to mark your
+own `@tool` as exempt from spilling. `spill_exempt` exists as an internal
+`AgentTool` field (set on `read_tool_output` itself, to prevent the
+spill-retrieve loop above), but it is not a parameter the `@tool` decorator
+accepts — an authored tool's results are always eligible for spilling.
 
 ## Subagents
 

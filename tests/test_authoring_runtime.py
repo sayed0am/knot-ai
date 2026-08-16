@@ -176,6 +176,64 @@ async def test_child_failure_produces_error_result_and_parent_turn_continues(
     store.close()
 
 
+async def test_delegation_result_over_parent_cap_is_spilled_by_parents_own_sink(
+    tmp_path: Path,
+) -> None:
+    """A subagent's final answer is itself a tool result in the parent (the
+    delegation call's result) and is bounded by the PARENT's own spill
+    policy like any other oversized result — no special case (design D4).
+    """
+    _single_subagent_fleet(tmp_path)
+    fleet = compile_fleet(tmp_path)
+
+    from knot.core.session.store import SessionStore
+
+    store = SessionStore(":memory:")
+    big_answer = "the answer is 42, " * 50  # well over the 200-byte cap below
+    provider = FakeProvider(
+        [
+            reply(tool_calls=[ToolCall(id="c1", name="researcher", arguments={"message": "x"})]),
+            reply(big_answer),
+            reply("root says: done"),
+        ]
+    )
+    runtime = AgentRuntime(
+        fleet=fleet, store=store, provider=provider, max_result_bytes=200, invariant_mode="strict"
+    )
+    session = runtime.create_session("root")
+
+    events = [event async for event in runtime.run_turn(session.session_id, "research x")]
+    end = events[-1]
+    assert end.outcome == "completed"
+
+    # The model-visible result on the parent's own event stream is bounded.
+    tool_result = next(m for m in end.messages if isinstance(m, ToolResultMessage))
+    assert tool_result.is_error is False
+    assert len(tool_result.text.encode("utf-8")) <= 200
+    assert tool_result.details["spilled"] is True
+    assert tool_result.details["ref"] == "c1"
+    assert "full_content" not in tool_result.details
+
+    # The persisted entry for the parent session carries the same
+    # preview+ref, not the full answer (bounded-surfaces invariant).
+    parent_entries = derive_state(store.entries(session.session_id))
+    persisted_result = next(
+        m
+        for m in parent_entries.messages
+        if isinstance(m, ToolResultMessage) and m.tool_call_id == "c1"
+    )
+    assert persisted_result.details["spilled"] is True
+    assert persisted_result.details["ref"] == "c1"
+    assert len(persisted_result.text.encode("utf-8")) <= 200
+
+    # The parent session's own spills table holds the full original text —
+    # the child's session is a completely separate store row.
+    spill = store.read_spill(session.session_id, "c1")
+    assert spill is not None
+    assert spill[0] == big_answer
+    store.close()
+
+
 async def test_parallel_delegations_to_two_subagents_run_concurrently(tmp_path: Path) -> None:
     write_files(
         tmp_path,

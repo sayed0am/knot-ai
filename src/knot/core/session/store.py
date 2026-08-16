@@ -58,6 +58,15 @@ CREATE TABLE IF NOT EXISTS entries (
 CREATE INDEX IF NOT EXISTS idx_entries_type ON entries(type);
 CREATE INDEX IF NOT EXISTS idx_sessions_agent_id ON sessions(agent_id);
 CREATE INDEX IF NOT EXISTS idx_sessions_parent_session_id ON sessions(parent_session_id);
+
+CREATE TABLE IF NOT EXISTS spills (
+    session_id TEXT NOT NULL REFERENCES sessions(session_id),
+    tool_call_id TEXT NOT NULL,
+    content TEXT NOT NULL,
+    original_bytes INTEGER NOT NULL,
+    created_at INTEGER NOT NULL,
+    PRIMARY KEY (session_id, tool_call_id)
+);
 """
 
 
@@ -209,6 +218,49 @@ class SessionStore:
                 "SELECT * FROM entries WHERE session_id = ? ORDER BY seq ASC", (session_id,)
             ).fetchall()
         return [_row_to_entry(row) for row in rows]
+
+    # -- spills -----------------------------------------------------------
+
+    def save_spill(self, session_id: str, tool_call_id: str, text: str) -> None:
+        """Durably store ``text`` as the full spilled content of one tool call.
+
+        ``INSERT OR REPLACE`` on the ``(session_id, tool_call_id)`` primary
+        key makes this overwrite-safe: a retried or re-executed call simply
+        replaces its own prior spill row rather than erroring or
+        accumulating duplicates.
+        """
+        original_bytes = len(text.encode("utf-8"))
+        created_at = current_timestamp_ms()
+        with self._lock:
+            self._conn.execute(
+                "INSERT OR REPLACE INTO spills "
+                "(session_id, tool_call_id, content, original_bytes, created_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (session_id, tool_call_id, text, original_bytes, created_at),
+            )
+            self._conn.commit()
+
+    def read_spill(self, session_id: str, tool_call_id: str) -> tuple[str, int] | None:
+        """Return ``(text, original_bytes)`` for one spill, or ``None`` if absent."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT content, original_bytes FROM spills "
+                "WHERE session_id = ? AND tool_call_id = ?",
+                (session_id, tool_call_id),
+            ).fetchone()
+        return (row["content"], row["original_bytes"]) if row is not None else None
+
+    def delete_spills(self, session_id: str) -> None:
+        """Remove every spill row belonging to ``session_id``.
+
+        No session-deletion path exists yet in the store (there is no
+        ``delete_session``), so nothing calls this today; it is exposed as
+        the hook a future session-deletion feature wires spill cleanup
+        into, per the spill lifecycle this table's design depends on.
+        """
+        with self._lock:
+            self._conn.execute("DELETE FROM spills WHERE session_id = ?", (session_id,))
+            self._conn.commit()
 
     # -- single-writer enforcement ---------------------------------------
 

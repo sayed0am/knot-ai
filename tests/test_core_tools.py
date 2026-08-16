@@ -97,3 +97,43 @@ async def test_execute_tool_applies_max_result_bytes() -> None:
     assert result.details["truncated"] is True
     assert result.details["original_bytes"] == 100
     assert result.details["full_content"] == "x" * 100
+
+
+async def test_execute_tool_uses_spill_sink_when_over_budget() -> None:
+    async def big(tool_call_id, arguments, signal=None, on_update=None):
+        return AgentToolResult(content=[TextContent(text="x" * 1000)])
+
+    tool = AgentTool(name="big", description="", parameters={}, execute_fn=big)
+    call = ToolCall(id="c1", name="big", arguments={})
+    store: dict[str, str] = {}
+
+    def sink(call_id: str, text: str) -> str:
+        store[call_id] = text
+        return call_id
+
+    result, is_error = await execute_tool(tool, call, max_result_bytes=250, spill_sink=sink)
+
+    assert is_error is False
+    assert result.details["spilled"] is True
+    assert result.details["ref"] == "c1"
+    assert "full_content" not in result.details
+    assert store["c1"] == "x" * 1000
+
+
+async def test_execute_tool_spill_exempt_tool_skips_sink() -> None:
+    async def big(tool_call_id, arguments, signal=None, on_update=None):
+        return AgentToolResult(content=[TextContent(text="x" * 100)])
+
+    tool = AgentTool(name="big", description="", parameters={}, execute_fn=big, spill_exempt=True)
+    call = ToolCall(id="c1", name="big", arguments={})
+    store: dict[str, str] = {}
+
+    def sink(call_id: str, text: str) -> str:
+        store[call_id] = text
+        return call_id
+
+    result, is_error = await execute_tool(tool, call, max_result_bytes=20, spill_sink=sink)
+
+    assert is_error is False
+    assert result.details["truncated"] is True
+    assert "c1" not in store

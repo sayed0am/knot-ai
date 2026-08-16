@@ -48,6 +48,7 @@ from knot.core.events import (
 from knot.core.invariant import HistoryDivergenceError
 from knot.core.tool_history import provider_context
 from knot.core.tools import AgentTool, AgentToolResult, ToolParkedError, execute_tool
+from knot.core.truncation import SpillSink
 from knot.providers.events import (
     AssistantDoneEvent,
     AssistantErrorEvent,
@@ -112,10 +113,16 @@ async def run_agent_loop(
     get_follow_up_messages: Callable[[], Sequence[AgentMessage]] | None = None,
     tool_decision_hook: ToolDecisionHook | None = None,
     max_result_bytes: int | None = None,
+    spill_sink: SpillSink | None = None,
     default_question_ttl_seconds: int | None = None,
     pre_request_hook: Callable[[Sequence[AgentMessage]], Awaitable[None]] | None = None,
 ) -> AsyncIterator[AgentEvent]:
     """Run the provider/tool loop, emitting the core agent event grammar.
+
+    ``spill_sink`` threads alongside ``max_result_bytes`` down to
+    ``execute_tool`` for every executed call (see
+    ``knot.core.truncation.bound_tool_result``); ``None`` (the default)
+    preserves today's plain-truncation behavior exactly.
 
     ``default_question_ttl_seconds`` sets ``PendingInputRequest.ttl_seconds``
     for execute-less (question) parks, e.g. ``ask_user``; ``None`` (the
@@ -239,6 +246,7 @@ async def run_agent_loop(
                     signal,
                     tool_decision_hook,
                     max_result_bytes,
+                    spill_sink,
                     tool_results,
                     pending_requests,
                     default_question_ttl_seconds,
@@ -318,6 +326,7 @@ async def _run_tool_phase(
     signal: CancellationToken | None,
     tool_decision_hook: ToolDecisionHook | None,
     max_result_bytes: int | None,
+    spill_sink: SpillSink | None,
     tool_results: list[ToolResultMessage],
     pending_requests: list[PendingInputRequest],
     default_question_ttl_seconds: int | None = None,
@@ -354,7 +363,7 @@ async def _run_tool_phase(
             runnable.append((call, tool))
 
     async for event in _run_concurrent_tools(
-        runnable, signal, max_result_bytes, results_by_id, pending_requests
+        runnable, signal, max_result_bytes, spill_sink, results_by_id, pending_requests
     ):
         yield event
 
@@ -407,6 +416,7 @@ async def _run_concurrent_tools(
     runnable: list[tuple[ToolCall, AgentTool]],
     signal: CancellationToken | None,
     max_result_bytes: int | None,
+    spill_sink: SpillSink | None,
     results_out: dict[str, ToolResultMessage],
     pending_out: list[PendingInputRequest],
 ) -> AsyncIterator[AgentEvent]:
@@ -421,7 +431,9 @@ async def _run_concurrent_tools(
     token = _current_event_queue.set(queue)
     try:
         tasks = [
-            asyncio.create_task(_execute_and_report(call, tool, signal, queue, max_result_bytes))
+            asyncio.create_task(
+                _execute_and_report(call, tool, signal, queue, max_result_bytes, spill_sink)
+            )
             for call, tool in runnable
         ]
         target = len(tasks)
@@ -460,6 +472,7 @@ async def _execute_and_report(
     signal: CancellationToken | None,
     queue: asyncio.Queue[AgentEvent | _ParkedSignal],
     max_result_bytes: int | None,
+    spill_sink: SpillSink | None,
 ) -> None:
     await queue.put(
         ToolExecutionStartEvent(tool_call_id=call.id, tool_name=call.name, args=call.arguments)
@@ -477,7 +490,12 @@ async def _execute_and_report(
 
     try:
         result, is_error = await execute_tool(
-            tool, call, signal, on_update, max_result_bytes=max_result_bytes
+            tool,
+            call,
+            signal,
+            on_update,
+            max_result_bytes=max_result_bytes,
+            spill_sink=spill_sink,
         )
     except ToolParkedError as exc:
         await queue.put(_ParkedSignal(request=exc.request))

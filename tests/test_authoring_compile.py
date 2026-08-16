@@ -91,9 +91,7 @@ def test_bundle_with_missing_snapshot_fails_atomically_no_partial_tools(tmp_path
 
     fleet = compile_fleet(tmp_path)
 
-    assert any(
-        "snapshot" in d.message and d.bundle_id == "utils" for d in fleet.bundle_diagnostics
-    )
+    assert any("snapshot" in d.message and d.bundle_id == "utils" for d in fleet.bundle_diagnostics)
     compiled = fleet.agents["helper"]
     assert compiled.ok is False
     assert any("utils" in d.message for d in compiled.diagnostics)
@@ -185,9 +183,14 @@ def test_snapshot_tools_default_to_all_when_no_allow_list(tmp_path: Path) -> Non
     fleet = compile_fleet(tmp_path)
     manifest = fleet.agents["helper"].manifest
     assert manifest is not None
-    # ask_user is the always-on framework-floor tool; billing__get_invoice
-    # is the only connection tool that survived the allow list.
-    assert {t.name for t in manifest.tools} == {"billing__get_invoice", "ask_user"}
+    # ask_user and read_tool_output are the always-on framework-floor tools;
+    # billing__get_invoice is the only connection tool that survived the
+    # allow list.
+    assert {t.name for t in manifest.tools} == {
+        "billing__get_invoice",
+        "ask_user",
+        "read_tool_output",
+    }
 
 
 def test_provided_arguments_stripped_from_model_facing_schema(tmp_path: Path) -> None:
@@ -483,9 +486,7 @@ def test_subagent_own_compile_error_fails_parent_with_prefixed_diagnostics(
     compiled = fleet.agents["helper"]
 
     assert compiled.ok is False
-    assert any(
-        "researcher" in d.message and "boom" in d.message for d in compiled.diagnostics
-    )
+    assert any("researcher" in d.message and "boom" in d.message for d in compiled.diagnostics)
 
 
 def test_subagent_name_collision_with_authored_tool_is_an_error_naming_both(

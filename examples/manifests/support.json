@@ -129,6 +129,40 @@
     },
     {
       "approval": "never",
+      "description": "Retrieve the full content of a tool result that was spilled (replaced by a bounded preview and a notice naming a ref). Page through it with offsetBytes/limitBytes (raw byte slices of the stored text), or search it with a regex pattern to find where something is before paging to it.",
+      "executable": false,
+      "idempotent": true,
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "limitBytes": {
+            "description": "Maximum bytes to return, clamped to a hard ceiling of 16384. Default 16384.",
+            "type": "integer"
+          },
+          "offsetBytes": {
+            "description": "Byte offset into the spilled content to start reading from. Default 0.",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "pattern": {
+            "description": "A Python regular expression to search the full spilled content for, instead of paging. Returns up to 20 matches, each with its byte offset and a small context window, so a match's offset can be paged from with offsetBytes on a follow-up call.",
+            "type": "string"
+          },
+          "ref": {
+            "description": "The retrieval reference named in a spill notice (the originating tool call's id).",
+            "type": "string"
+          }
+        },
+        "required": [
+          "ref"
+        ],
+        "type": "object"
+      },
+      "name": "read_tool_output",
+      "source": "builtin"
+    },
+    {
+      "approval": "never",
       "description": "Searches internal account notes for context relevant to a support ticket. Invoke with a short, specific natural-language request describing what to look for (an order id or account detail); it has no memory of the parent conversation.",
       "executable": true,
       "idempotent": false,

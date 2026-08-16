@@ -12,6 +12,21 @@ _ORDERS: dict[str, dict[str, str | None]] = {
     "ORD-1001": {"status": "shipped", "carrier": "UPS", "eta": "2026-08-16"},
     "ORD-1002": {"status": "processing", "carrier": None, "eta": None},
     "ORD-1003": {"status": "delivered", "carrier": "USPS", "eta": "2026-08-05"},
+    # A deliberately verbose carrier note (still fixed and deterministic) so
+    # tests can exercise oversized-result handling (spill) without needing a
+    # dedicated tool: this order's tracking history alone is large enough to
+    # exceed a small ``max_result_bytes`` cap.
+    "ORD-9001": {
+        "status": "shipped",
+        "carrier": (
+            "GlobalFreight Express, routed HUB-14 -> HUB-22 -> HUB-31 -> Regional Depot 9, "
+            "cross-docked twice, temperature-controlled, signature required on delivery, "
+            "insured up to $10,000, tracking refreshed hourly, customs cleared at HUB-22 "
+            "on 2026-08-12, held for inspection for six hours, released without incident, "
+            "final leg handed to a local courier partner for last-mile delivery"
+        ),
+        "eta": "2026-08-20",
+    },
 }
 
 

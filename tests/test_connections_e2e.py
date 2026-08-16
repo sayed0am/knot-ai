@@ -256,7 +256,7 @@ async def test_park_leaves_no_open_connection_in_the_pool(tmp_path: Path) -> Non
         store.close()
 
 
-async def test_oversized_connection_result_is_truncated_by_max_result_bytes(
+async def test_oversized_connection_result_is_spilled_by_max_result_bytes(
     tmp_path: Path,
 ) -> None:
     async with mock_mcp_server(big_result_size=5_000) as handle:
@@ -289,8 +289,11 @@ async def test_oversized_connection_result_is_truncated_by_max_result_bytes(
             m for m in events[-1].messages if getattr(m, "tool_call_id", None) == "c1"
         )
         assert len(tool_result.text.encode("utf-8")) <= 200
-        assert "truncated" in tool_result.text
+        assert "spilled" in tool_result.text
+        assert tool_result.details["spilled"] is True
         assert tool_result.details["original_bytes"] == 5_000
+        assert tool_result.details["ref"] == "c1"
+        assert store.read_spill(session.session_id, "c1") == ("x" * 5_000, 5_000)
 
         await pool.aclose_all()
         store.close()

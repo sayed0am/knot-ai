@@ -62,13 +62,14 @@ def test_manifest_shape_has_expected_top_level_keys(tmp_path: Path) -> None:
     assert data["agentId"] == "helper"
     assert data["instructionsPath"] == "agents/helper/instructions.md"
     assert "instructionsSha256" in data
-    # ask_user is the always-on framework-floor tool; it is the only tool an
-    # otherwise-empty agent gets.
-    assert len(data["tools"]) == 1
-    ask_user = data["tools"][0]
-    assert ask_user["name"] == "ask_user"
-    assert ask_user["source"] == "builtin"
-    assert ask_user["executable"] is False
+    # ask_user and read_tool_output are the always-on framework-floor tools;
+    # they are the only tools an otherwise-empty agent gets.
+    assert len(data["tools"]) == 2
+    tools_by_name = {t["name"]: t for t in data["tools"]}
+    assert set(tools_by_name) == {"ask_user", "read_tool_output"}
+    for tool in tools_by_name.values():
+        assert tool["source"] == "builtin"
+        assert tool["executable"] is False
     assert data["skills"] == []
     assert data["subagentIds"] == []
     assert data["use"] == []

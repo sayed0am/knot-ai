@@ -383,9 +383,7 @@ def _install_routes(app: FastAPI, state: ServerState) -> None:  # noqa: C901 - o
         if compiled is None:
             raise HTTPException(status_code=404, detail=f"unknown agent {agent_id!r}")
         if not compiled.ok:
-            raise HTTPException(
-                status_code=409, detail=f"agent {agent_id!r} failed to compile"
-            )
+            raise HTTPException(status_code=409, detail=f"agent {agent_id!r} failed to compile")
         record = state.runtime.create_session(agent_id)
         return {
             "sessionId": record.session_id,
@@ -455,7 +453,14 @@ def _install_routes(app: FastAPI, state: ServerState) -> None:  # noqa: C901 - o
 
         tools = state.runtime.build_live_tools(session_id)
         responses = {rid: item.to_hitl_response() for rid, item in body.responses.items()}
-        outcome = await resolve_inputs(state.store, session_id, responses, tools=tools)
+        outcome = await resolve_inputs(
+            state.store,
+            session_id,
+            responses,
+            tools=tools,
+            max_result_bytes=state.runtime.max_result_bytes_for(session_id),
+            spill_sink=state.runtime.build_spill_sink(session_id),
+        )
 
         result = {
             "resolved": outcome.resolved,

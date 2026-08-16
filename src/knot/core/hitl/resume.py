@@ -47,6 +47,7 @@ from knot.core.session.entries import (
 from knot.core.session.state import DerivedState, derive_state, rehydrate
 from knot.core.session.store import Entry, SessionStore
 from knot.core.tools import AgentTool, execute_tool
+from knot.core.truncation import SpillSink
 from knot.providers.messages import (
     AgentMessage,
     AssistantMessage,
@@ -349,6 +350,7 @@ class _ParkHandler(Protocol):
         tools: Mapping[str, AgentTool],
         messages: Sequence[AgentMessage],
         max_result_bytes: int | None,
+        spill_sink: SpillSink | None,
     ) -> _Disposition: ...
 
 
@@ -361,6 +363,7 @@ async def _resolve_tool_approval(
     tools: Mapping[str, AgentTool],
     messages: Sequence[AgentMessage],
     max_result_bytes: int | None,
+    spill_sink: SpillSink | None,
 ) -> _Disposition:
     if isinstance(response, DenyResponse):
         _write_denial(
@@ -393,7 +396,9 @@ async def _resolve_tool_approval(
     _write_execution_started(store, session_id, request)
 
     call = _resolve_call(request, messages)
-    result, is_error = await execute_tool(tool, call, max_result_bytes=max_result_bytes)
+    result, is_error = await execute_tool(
+        tool, call, max_result_bytes=max_result_bytes, spill_sink=spill_sink
+    )
     _write_message(
         store,
         session_id,
@@ -417,6 +422,7 @@ async def _resolve_question(
     tools: Mapping[str, AgentTool],
     messages: Sequence[AgentMessage],
     max_result_bytes: int | None,
+    spill_sink: SpillSink | None,
 ) -> _Disposition:
     if isinstance(response, DenyResponse):
         _write_denial(
@@ -460,6 +466,7 @@ async def _resolve_child_session(
     tools: Mapping[str, AgentTool],
     messages: Sequence[AgentMessage],
     max_result_bytes: int | None,
+    spill_sink: SpillSink | None,
 ) -> _Disposition:
     """A ``child_session`` park never accepts a direct human response: it
     resolves only through the child session's own eventual completion (see
@@ -487,6 +494,7 @@ async def resolve_inputs(
     tools: Mapping[str, AgentTool],
     now_ms: int | None = None,
     max_result_bytes: int | None = None,
+    spill_sink: SpillSink | None = None,
 ) -> ResolveOutcome:
     """Resolve a batch of pending requests against their structured responses.
 
@@ -494,6 +502,13 @@ async def resolve_inputs(
     immediately and independently of the others; the caller learns whether
     the run is ready to continue via ``ResolveOutcome.ready_to_continue``
     (also available standalone as ``is_ready_to_continue``).
+
+    ``spill_sink``, when given, is threaded into the approve path's
+    ``execute_tool`` call exactly like ``max_result_bytes`` — an
+    approved-then-resumed tool call is bounded the same way a live one
+    would be, spilling an oversized result rather than only truncating it.
+    Pass ``AgentRuntime.build_spill_sink(session_id)`` here (see
+    ``knot.authoring.runtime``) to get that behavior outside a live turn.
     """
     now = now_ms if now_ms is not None else current_timestamp_ms()
     entries = store.entries(session_id)
@@ -534,6 +549,7 @@ async def resolve_inputs(
             tools=tools,
             messages=derived.messages,
             max_result_bytes=max_result_bytes,
+            spill_sink=spill_sink,
         )
         if disposition.status == "resolved":
             resolved.append(request_id)
@@ -650,12 +666,20 @@ def detect_crash_windows(
 
 
 async def repair_crash_windows(
-    store: SessionStore, session_id: str, tools: Mapping[str, AgentTool]
+    store: SessionStore,
+    session_id: str,
+    tools: Mapping[str, AgentTool],
+    *,
+    spill_sink: SpillSink | None = None,
 ) -> RepairReport:
     """Repair every crash window: idempotent tools re-execute automatically;
     non-idempotent tools are reported (``needs_operator``) and never
     silently re-run — that decision belongs to ``operator_skip`` (or a
     future manual re-approval), never to this function.
+
+    ``spill_sink`` is threaded into the re-executed tool's ``execute_tool``
+    call the same way ``resolve_inputs`` threads it into the approve path —
+    a repaired call spills exactly like a live one.
     """
     windows = detect_crash_windows(store, session_id, tools)
     messages = rehydrate(store, session_id).messages
@@ -678,7 +702,7 @@ async def repair_crash_windows(
             store.append_entry(
                 session_id, ENTRY_TYPE_EXECUTION_STARTED, started.model_dump(by_alias=True)
             )
-            result, is_error = await execute_tool(tool, call)
+            result, is_error = await execute_tool(tool, call, spill_sink=spill_sink)
             _write_message(
                 store,
                 session_id,

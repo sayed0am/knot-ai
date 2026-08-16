@@ -130,6 +130,73 @@ async def test_approve_writes_three_ordered_records_then_continue_completes(
     store.close()
 
 
+async def test_approved_resume_spills_oversized_result_via_threaded_sink(
+    tmp_path: Path,
+) -> None:
+    """An approved-then-resumed tool call must spill exactly like a live
+    one: ``resolve_inputs``'s approve path threads ``spill_sink`` into its
+    own ``execute_tool`` call the same way ``max_result_bytes`` already
+    flows, so a call that only completes after a park is bounded no
+    differently than one that completed synchronously mid-run.
+    """
+    db_path = tmp_path / "sessions.db"
+    store = SessionStore(db_path)
+    session = store.create_session("agent_a")
+
+    big_text = "y" * 1000
+
+    async def execute_fn(tool_call_id, arguments, signal=None, on_update=None):
+        return AgentToolResult(content=big_text)
+
+    tool = AgentTool(name="sensitive_op", description="", parameters={}, execute_fn=execute_fn)
+    hook = build_decision_hook(
+        {"sensitive_op": "always"}, store=store, session_id=session.session_id
+    )
+    call = ToolCall(id="call_1", name="sensitive_op", arguments={})
+    provider = FakeProvider([reply(tool_calls=[call])])
+    harness, subscriber = _make_harness(
+        store, session.session_id, provider, tools=[tool], tool_decision_hook=hook
+    )
+
+    events = [event async for event in harness.prompt("go")]
+    subscriber.release()
+    request = events[-1].pending_requests[0]
+
+    spilled: dict[str, str] = {}
+
+    def spill_sink(call_id: str, text: str) -> str:
+        spilled[call_id] = text
+        return call_id
+
+    outcome = await resolve_inputs(
+        store,
+        session.session_id,
+        {request.id: ApproveResponse(resolved_by="tester")},
+        tools={"sensitive_op": tool},
+        max_result_bytes=200,
+        spill_sink=spill_sink,
+    )
+    assert outcome.resolved == [request.id]
+
+    result_entry = next(
+        e
+        for e in _entries_by_type(store, session.session_id, "message")
+        if e.payload.get("toolCallId") == "call_1"
+    )
+    details = result_entry.payload["details"]
+    assert details["spilled"] is True
+    assert details["ref"] == "call_1"
+    assert "fullContent" not in details
+
+    content_text = "".join(
+        block["text"] for block in result_entry.payload["content"] if block.get("type") == "text"
+    )
+    assert len(content_text.encode("utf-8")) <= 200
+
+    assert spilled["call_1"] == big_text
+    store.close()
+
+
 async def test_deny_carries_reason_into_next_provider_call(tmp_path: Path) -> None:
     db_path = tmp_path / "sessions.db"
     store = SessionStore(db_path)

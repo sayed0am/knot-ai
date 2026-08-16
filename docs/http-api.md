@@ -234,7 +234,7 @@ the wire.
 | `message_start` / `message_update` / `message_end` | `message: AgentMessage` (`message_update` also carries `assistantMessageEvent`) | Streaming lifecycle of one message — the user message that started the turn, then the assistant's reply as it streams in. |
 | `tool_execution_start` | `toolCallId, toolName, args` | A tool call is about to run. |
 | `tool_execution_update` | `..., partialResult` | A tool reported incremental progress (rare; most tools don't). |
-| `tool_execution_end` | `toolCallId, toolName, result, isError` | A tool call finished (or failed). |
+| `tool_execution_end` | `toolCallId, toolName, result, isError` | A tool call finished (or failed). If the result's text exceeded the agent's `max_result_bytes`, `result` is the bounded preview+notice, not the full text — see [An oversized result, spilled](#an-oversized-result-spilled) below. |
 | `turn_end` | `message, toolResults` | One model turn's assistant message plus any tool results produced for it. |
 | `subagent_called` | `toolCallId, subagentId, childSessionId` | A delegation call just created a child session — control-plane only, not durably recorded. |
 | `subagent_completed` | `toolCallId, subagentId, childSessionId, outcome` | That child session reached *some* terminal state for this call — `outcome` is the child's own `agent_end.outcome`, including `"waiting_input"` if the child itself parked. |
@@ -312,6 +312,28 @@ happens only once a human resolves it via `/input`, as part of the *next*
 `/continue` stream (or synchronously inside `/input` itself for the
 approve-and-execute case — see the endpoint's own description above).
 
+### An oversized result, spilled
+
+When a tool result's text exceeds the agent's `max_result_bytes` (see
+`docs/authoring-agents.md`), it is *spilled*: `result.content` carries a
+bounded head/tail preview of the original text plus a notice naming the
+omitted byte count and how to retrieve the rest, and `result.details`
+carries `{"spilled": true, "original_bytes": <int>, "ref": <string>}`.
+**The full original text never rides this event, the persisted transcript,
+or any later provider request — only the preview does.** Retrieve the full
+content with the always-available `read_tool_output` tool, called with
+`ref` (see `docs/authoring-agents.md` for its full parameter set):
+
+```
+event: tool_execution_end
+data: {"type":"tool_execution_end","toolCallId":"call_lookup","toolName":"lookup_order","result":{"content":[{"type":"text","text":"Order O\n[... 406 bytes omitted ...]\n6-08-20.\n[spilled: result was 421 bytes, limit 200. Full content stored; retrieve with read_tool_output(ref=\"call_lookup\") using offsetBytes/limitBytes or pattern.]","textSignature":null}],"details":{"spilled":true,"original_bytes":421,"ref":"call_lookup"}},"isError":false}
+```
+
+A result within the cap carries `details: null` (or whatever the tool
+itself returned) and its content is untouched — spilling only ever replaces
+a result that would otherwise exceed the cap, and the replacement is always
+within it.
+
 ## Delegation and the chain event
 
 A delegation call (a subagent tool call) either returns the child's answer
@@ -362,7 +384,7 @@ continue its parent, and so on up to the root.
 
 - **`user`** — `{"role": "user", "content": "<text>", "timestamp": ...}`.
 - **`assistant`** — `{"role": "assistant", "content": [TextContent | ThinkingContent | ToolCall, ...], "api", "provider", "model", "usage", "stopReason", "errorMessage", "timestamp", ...}`. A `ToolCall` content block is `{"type": "toolCall", "id", "name", "arguments"}`.
-- **`toolResult`** — `{"role": "toolResult", "toolCallId", "toolName", "content": [...], "isError", "timestamp"}`. This is what a delegation call's result looks like in the *parent's* transcript too: `toolName` is the subagent's id, and `content` is the child's final answer text.
+- **`toolResult`** — `{"role": "toolResult", "toolCallId", "toolName", "content": [...], "details", "isError", "timestamp"}`. This is what a delegation call's result looks like in the *parent's* transcript too: `toolName` is the subagent's id, and `content` is the child's final answer text. `details` is normally `null`; for a spilled result it is `{"spilled": true, "original_bytes", "ref"}` and `content` is the bounded preview, never the full text — see [An oversized result, spilled](#an-oversized-result-spilled) above.
 - **`custom`** — an escape hatch for provider-specific message shapes; not produced by anything described in this document.
 
 ## State semantics

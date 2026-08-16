@@ -17,7 +17,7 @@ from typing import TYPE_CHECKING, Protocol
 
 from pydantic import Field, model_validator
 
-from knot.core.truncation import truncate_tool_result
+from knot.core.truncation import SpillSink, bound_tool_result
 from knot.providers.messages import ImageContent, TextContent, ToolCall, WireModel
 from knot.providers.provider import CancellationToken
 from knot.providers.types import JSONValue
@@ -103,6 +103,12 @@ class AgentTool:
     execute_fn: ToolExecutor | None = None
     idempotent: bool = False
     label: str | None = None
+    #: Pager-like tools whose own output is already bounded by their
+    #: parameters (offset/limit, page size, ...) opt out of the spill sink
+    #: here so their results fall back to plain truncation instead —
+    #: structurally prevents a spill→retrieve→spill loop on the framework's
+    #: own retrieval tool without name-matching it.
+    spill_exempt: bool = False
 
     @property
     def input_schema(self) -> Mapping[str, JSONValue]:
@@ -117,14 +123,19 @@ async def execute_tool(
     on_update: ToolUpdateCallback | None = None,
     *,
     max_result_bytes: int | None = None,
+    spill_sink: SpillSink | None = None,
 ) -> tuple[AgentToolResult, bool]:
     """Run one validated tool call, standalone or from within the loop.
 
     Returns ``(result, is_error)``. Any exception raised by
     ``tool.execute_fn`` is converted into an error result and never
     propagates, except ``asyncio.CancelledError``, which always re-raises.
-    When ``max_result_bytes`` is set, an oversized result is truncated (see
-    ``knot.core.truncation``).
+    When ``max_result_bytes`` is set, an oversized result is bounded (see
+    ``knot.core.truncation.bound_tool_result``): ``spill_sink``, when given,
+    stores the full text and replaces it with a bounded preview+notice;
+    ``tool.spill_exempt`` tools always skip the sink and fall back to plain
+    truncation, since their own output is already bounded by their
+    parameters (see ``AgentTool.spill_exempt``).
 
     ``tool.execute_fn`` must not be ``None``. An execute-less tool is a
     parking decision made by the caller, not something this function can
@@ -144,7 +155,9 @@ async def execute_tool(
         result = AgentToolResult(content=[TextContent(text=str(exc))])
         is_error = True
 
-    return truncate_tool_result(result, max_result_bytes), is_error
+    effective_sink = None if tool.spill_exempt else spill_sink
+    bounded = bound_tool_result(result, call.id, max_result_bytes, effective_sink)
+    return bounded, is_error
 
 
 __all__ = [

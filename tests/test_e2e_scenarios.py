@@ -17,8 +17,10 @@ from pathlib import Path
 from server_fixtures import client_for, make_app, parse_sse
 
 from knot.authoring.compile import compile_fleet
+from knot.core.session.state import derive_state
 from knot.core.session.store import SessionStore
 from knot.providers.fake import FakeProvider, reply, tool_call
+from knot.providers.messages import ToolResultMessage
 from knot.server.app import create_app
 
 _FLEET_ROOT = Path(__file__).resolve().parent.parent / "examples" / "fleet"
@@ -324,3 +326,167 @@ async def test_scenario_restart_recovery_mid_park(tmp_path: Path) -> None:
         assert final["state"] == "idle"
         assistant_text = final["transcript"][-1]["content"][0]["text"]
         assert "silver" in assistant_text
+
+
+# ---------------------------------------------------------------------------
+# Scenario 5: oversized tool result spills, is retrieved, parks, and
+# survives a restart
+# ---------------------------------------------------------------------------
+
+
+async def test_scenario_oversized_result_spills_is_retrieved_and_survives_restart(
+    tmp_path: Path,
+) -> None:
+    """``lookup_order`` returns a result over the configured
+    ``max_result_bytes`` cap, so it is spilled: the streamed result carries
+    a bounded preview and a retrieval notice (not the full text), and the
+    scripted model immediately calls the framework ``read_tool_output`` tool
+    with the notice's ref and gets the full content back paged. The model
+    then requests a gated call (``update_customer``), which parks the
+    session. The process is then "restarted" (a fresh app + store over the
+    same sqlite file), and after the gated call is approved and the run
+    continues, the resumed model calls ``read_tool_output`` with the same
+    ref again and gets exactly the same content back — proving the spill
+    survived the restart.
+
+    Along the way (task 6.2) this also asserts the three bounded surfaces
+    for the spilled result: the persisted message entry (read from the
+    store directly), the SSE ``tool_execution_end`` payload, and the next
+    provider request's message history each carry only the preview text and
+    ``{spilled, original_bytes, ref}`` — never the full original text.
+    """
+    db_path = str(tmp_path / "knot.db")
+    ref = "call_lookup"
+    downgrade_args = {"customer_id": "CUST-1", "field": "tier", "value": "gold"}
+    provider1 = FakeProvider(
+        [
+            tool_call("lookup_order", {"order_id": "ORD-9001"}, id=ref),
+            tool_call("read_tool_output", {"ref": ref}, id="call_read1"),
+            tool_call("update_customer", downgrade_args, id="call_uc"),
+        ]
+    )
+    app1 = make_app(
+        _FLEET_ROOT,
+        [],
+        db_path=db_path,
+        provider=provider1,
+        runtime_kwargs={"max_result_bytes": 200},
+    )
+
+    async with client_for(app1) as client1:
+        session_id = (await client1.post("/agents/support/sessions")).json()["sessionId"]
+        stream = await client1.post(
+            f"/sessions/{session_id}/messages",
+            json={"text": "Where is order ORD-9001, and please bump CUST-1 to gold."},
+        )
+        assert stream.status_code == 200
+        events = parse_sse(stream.text)
+
+        # -- (a) the streamed tool result carries the preview + notice ----
+        tool_ends = {
+            data["toolCallId"]: data for etype, data in events if etype == "tool_execution_end"
+        }
+        lookup_end = tool_ends[ref]
+        lookup_text = "".join(
+            block["text"]
+            for block in lookup_end["result"]["content"]
+            if block.get("type") == "text"
+        )
+        assert len(lookup_text.encode("utf-8")) <= 200
+        assert "spilled" in lookup_text
+        assert "read_tool_output" in lookup_text
+        details = lookup_end["result"]["details"]
+        assert details["spilled"] is True
+        assert details["ref"] == ref
+        assert isinstance(details["original_bytes"], int) and details["original_bytes"] > 200
+        assert "full_content" not in details
+        assert "GlobalFreight" not in lookup_text  # the full carrier note didn't ride the wire
+
+        # -- (b) the model calls read_tool_output and gets the full content
+        read_end = tool_ends["call_read1"]
+        read_text = "".join(
+            block["text"] for block in read_end["result"]["content"] if block.get("type") == "text"
+        )
+        assert read_end["isError"] is False
+        assert "GlobalFreight" in read_text
+        assert f"ref={ref}" in read_text
+
+        # -- (c) the session parks on the gated update_customer call ------
+        request_id = _pending_request_id(events)
+        assert events[-1][1]["pendingRequests"][0]["toolName"] == "update_customer"
+
+        # -- 6.2: persisted entry, SSE payload, and provider history are
+        #         each bounded (preview + ref, never the full text) -------
+        persisted = derive_state(SessionStore(db_path).entries(session_id))
+        persisted_result = next(
+            m
+            for m in persisted.messages
+            if isinstance(m, ToolResultMessage) and m.tool_call_id == ref
+        )
+        assert persisted_result.details["spilled"] is True
+        assert persisted_result.details["ref"] == ref
+        assert len(persisted_result.text.encode("utf-8")) <= 200
+        assert "GlobalFreight" not in persisted_result.text
+
+        second_request_messages = provider1.calls[1][2]
+        provider_visible_result = next(
+            m
+            for m in second_request_messages
+            if isinstance(m, ToolResultMessage) and m.tool_call_id == ref
+        )
+        assert provider_visible_result.details["spilled"] is True
+        assert provider_visible_result.details["ref"] == ref
+        assert len(provider_visible_result.text.encode("utf-8")) <= 200
+        assert "GlobalFreight" not in provider_visible_result.text
+
+    # -- (d) simulated restart: fresh app + store over the same db file ---
+    app1.state.knot.store.close()
+    fleet2 = compile_fleet(_FLEET_ROOT)
+    store2 = SessionStore(db_path)
+    provider2 = FakeProvider(
+        [
+            tool_call("read_tool_output", {"ref": ref}, id="call_read2"),
+            reply("Order ORD-9001 confirmed and CUST-1 is now gold tier."),
+        ]
+    )
+    app2 = create_app(
+        fleet=fleet2,
+        store=store2,
+        provider=provider2,
+        runtime_kwargs={"max_result_bytes": 200, "invariant_mode": "strict"},
+    )
+
+    async with client_for(app2) as client2:
+        got = await client2.get(f"/sessions/{session_id}")
+        assert got.status_code == 200
+        assert got.json()["state"] == "waiting"
+
+        resolved = await client2.post(
+            f"/sessions/{session_id}/input",
+            json={"responses": {request_id: {"action": "approve", "by": "ops"}}},
+        )
+        assert resolved.status_code == 200
+        assert resolved.json()["readyToContinue"] is True
+
+        cont = await client2.post(f"/sessions/{session_id}/continue")
+        assert cont.status_code == 200
+        cont_events = parse_sse(cont.text)
+        assert cont_events[-1][1]["outcome"] == "completed"
+
+        # -- (e) the resumed model retrieves the same ref, gets the same
+        #        content back, exactly as before the restart -------------
+        resumed_read_end = next(
+            data
+            for etype, data in cont_events
+            if etype == "tool_execution_end" and data["toolCallId"] == "call_read2"
+        )
+        resumed_read_text = "".join(
+            block["text"]
+            for block in resumed_read_end["result"]["content"]
+            if block.get("type") == "text"
+        )
+        assert resumed_read_end["isError"] is False
+        assert resumed_read_text == read_text
+
+        final = (await client2.get(f"/sessions/{session_id}")).json()
+        assert final["state"] == "idle"

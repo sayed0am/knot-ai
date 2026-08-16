@@ -29,6 +29,7 @@ from knot.core.events import (
 from knot.core.loop import run_agent_loop
 from knot.core.tool_history import INTERRUPTED_TOOL_RESULT
 from knot.core.tools import AgentTool
+from knot.core.truncation import SpillSink
 from knot.providers.messages import (
     AgentMessage,
     AssistantMessage,
@@ -64,6 +65,7 @@ class AgentHarnessConfig:
     session_id: str | None = None
     tool_decision_hook: ToolDecisionHook | None = None
     max_result_bytes: int | None = None
+    spill_sink: SpillSink | None = None
     default_question_ttl_seconds: int | None = None
     pre_request_hook: Callable[[Sequence[AgentMessage]], Awaitable[None]] | None = None
 
@@ -238,6 +240,7 @@ class AgentHarness:
                 get_follow_up_messages=self._drain_follow_up_messages,
                 tool_decision_hook=self._config.tool_decision_hook,
                 max_result_bytes=self._config.max_result_bytes,
+                spill_sink=self._config.spill_sink,
                 default_question_ttl_seconds=self._config.default_question_ttl_seconds,
                 pre_request_hook=self._config.pre_request_hook,
             ):

@@ -145,3 +145,56 @@ def test_claim_writer_release_is_idempotent() -> None:
         claim = store.claim_writer(session.session_id)
         claim.release()
         claim.release()  # no error
+
+
+def test_save_and_read_spill_round_trip() -> None:
+    with SessionStore(":memory:") as store:
+        session = store.create_session("agent_a")
+        store.save_spill(session.session_id, "call_1", "hello world")
+
+        result = store.read_spill(session.session_id, "call_1")
+        assert result == ("hello world", len(b"hello world"))
+
+
+def test_read_spill_absent_key_returns_none() -> None:
+    with SessionStore(":memory:") as store:
+        session = store.create_session("agent_a")
+        assert store.read_spill(session.session_id, "call_missing") is None
+
+
+def test_save_spill_overwrites_on_duplicate_key() -> None:
+    with SessionStore(":memory:") as store:
+        session = store.create_session("agent_a")
+        store.save_spill(session.session_id, "call_1", "first")
+        store.save_spill(session.session_id, "call_1", "second, and longer")
+
+        text, original_bytes = store.read_spill(session.session_id, "call_1")
+        assert text == "second, and longer"
+        assert original_bytes == len(b"second, and longer")
+
+
+def test_save_and_read_spill_multi_mb_content() -> None:
+    with SessionStore(":memory:") as store:
+        session = store.create_session("agent_a")
+        big_text = "z" * (3 * 1024 * 1024)  # 3 MB
+        store.save_spill(session.session_id, "call_1", big_text)
+
+        text, original_bytes = store.read_spill(session.session_id, "call_1")
+        assert text == big_text
+        assert original_bytes == len(big_text)
+
+
+def test_delete_spills_removes_only_target_sessions_spills() -> None:
+    with SessionStore(":memory:") as store:
+        session_a = store.create_session("agent_a")
+        session_b = store.create_session("agent_b")
+        store.save_spill(session_a.session_id, "call_1", "a-content")
+        store.save_spill(session_b.session_id, "call_1", "b-content")
+
+        store.delete_spills(session_a.session_id)
+
+        assert store.read_spill(session_a.session_id, "call_1") is None
+        assert store.read_spill(session_b.session_id, "call_1") == (
+            "b-content",
+            len(b"b-content"),
+        )

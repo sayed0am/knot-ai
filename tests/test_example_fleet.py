@@ -38,6 +38,7 @@ def test_example_fleet_validates_clean_direct_call() -> None:
     tool_names = {t.name for t in support.manifest.tools}
     assert tool_names == {
         "ask_user",
+        "read_tool_output",
         "load_skill",
         "lookup_order",
         "researcher",

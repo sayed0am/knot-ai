@@ -73,7 +73,9 @@ from knot.core.loop import emit_loop_event
 from knot.core.session.persistence import PersistenceSubscriber
 from knot.core.session.state import DerivedState, harness_from_session, rehydrate
 from knot.core.session.store import SessionRecord, SessionStore
+from knot.core.spill_tool import READ_TOOL_OUTPUT_TOOL_NAME, build_read_tool_output_tool
 from knot.core.tools import AgentTool, AgentToolResult, ToolParkedError
+from knot.core.truncation import SpillSink
 from knot.providers.messages import AssistantMessage, TextContent, ToolResultMessage
 from knot.providers.provider import CancellationToken, ModelProvider
 
@@ -307,11 +309,14 @@ class AgentRuntime:
         ]
         manifest_tools_by_name = {t.name: t for t in manifest.tools}
         live_capability_tools = [
-            self._wire_connection_tool(
-                tool,
-                manifest_tools_by_name.get(tool.name),
+            self._wire_read_tool_output(
+                self._wire_connection_tool(
+                    tool,
+                    manifest_tools_by_name.get(tool.name),
+                    session_id=session_id,
+                    agent_id=compiled.agent_id,
+                ),
                 session_id=session_id,
-                agent_id=compiled.agent_id,
             )
             for tool in compiled.tools.values()
         ]
@@ -321,11 +326,7 @@ class AgentRuntime:
         hook = build_decision_hook(policies, store=self.store, session_id=session_id)
 
         model_name = manifest.model.name if manifest.model is not None else self.default_model
-        max_result_bytes = (
-            manifest.limits.max_result_bytes
-            if manifest.limits.max_result_bytes is not None
-            else self.max_result_bytes
-        )
+        max_result_bytes = self._max_result_bytes(manifest)
 
         # Every harness this method builds is store-backed by construction
         # (``harness_from_session`` below), so it always gets the
@@ -347,11 +348,72 @@ class AgentRuntime:
             max_turns=manifest.limits.max_turns,
             max_result_bytes=max_result_bytes,
             pre_request_hook=invariant_hook,
+            spill_sink=self.build_spill_sink(session_id),
         )
         harness = harness_from_session(self.store, session_id, config)
         if delegation_tools:
             harness.subscribe(_make_turn_reset_listener(turn_state))
         return harness
+
+    def _max_result_bytes(self, manifest: AgentManifest) -> int | None:
+        """One agent's effective inline cap: its own manifest limit, falling
+        back to this runtime's fleet-wide default. Shared by ``_build_harness``
+        and ``max_result_bytes_for`` (the latter for callers outside harness
+        assembly, e.g. the HTTP server's resume-with-approval path)."""
+        return (
+            manifest.limits.max_result_bytes
+            if manifest.limits.max_result_bytes is not None
+            else self.max_result_bytes
+        )
+
+    def max_result_bytes_for(self, session_id: str) -> int | None:
+        """The effective inline cap for one session, resolved through its
+        compiled agent's manifest (see ``_max_result_bytes``).
+
+        Meant for the resume-with-approval path (``knot.core.hitl.resume.
+        resolve_inputs``), which executes a tool outside ``_build_harness``
+        and needs the same cap a live turn would use so an approved-then-
+        resumed call is bounded identically to one executed mid-run.
+        """
+        compiled = self._resolve_compiled_agent(session_id)
+        assert compiled.manifest is not None
+        return self._max_result_bytes(compiled.manifest)
+
+    def build_spill_sink(self, session_id: str) -> SpillSink:
+        """Build one session's spill sink: durably stores a spilled tool
+        result's full text via the session store and hands back the
+        originating tool call id as the retrieval reference.
+
+        Bound to ``session_id`` by closure so every result spilled during
+        that session's runs lands in its own row of the store's ``spills``
+        table (see ``knot.core.session.store.SessionStore.save_spill``) —
+        the exact ref a later ``read_tool_output`` call resolves (see
+        ``knot.core.spill_tool``). Public (not ``_build_spill_sink``) for
+        the same reason as ``max_result_bytes_for``: the resume-with-approval
+        path needs this outside harness assembly, sourcing the same
+        ``(store, session_id)`` it already has.
+        """
+        store = self.store
+
+        def spill_sink(call_id: str, text: str) -> str:
+            store.save_spill(session_id, call_id, text)
+            return call_id
+
+        return spill_sink
+
+    def _wire_read_tool_output(self, tool: AgentTool, *, session_id: str) -> AgentTool:
+        """Give the ``read_tool_output`` placeholder its live executor.
+
+        Every other capability compiles fully live except connection tools
+        (see ``_wire_connection_tool``) and this one: it needs
+        ``(store, session_id)`` (see ``knot.core.spill_tool``), which only
+        exist here at runtime assembly, so ``knot.authoring.compile`` gives
+        it an execute-less placeholder and this replaces it, matching the
+        exact same two-phase split as a connection tool.
+        """
+        if tool.name != READ_TOOL_OUTPUT_TOOL_NAME:
+            return tool
+        return build_read_tool_output_tool(self.store, session_id)
 
     def _wire_connection_tool(
         self,
@@ -637,8 +699,7 @@ class AgentRuntime:
             (
                 r
                 for r in pending
-                if r.kind == "child_session"
-                and r.tool_call_id == child_record.parent_tool_call_id
+                if r.kind == "child_session" and r.tool_call_id == child_record.parent_tool_call_id
             ),
             None,
         )
