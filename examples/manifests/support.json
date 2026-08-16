@@ -1,5 +1,13 @@
 {
   "agentId": "support",
+  "compaction": {
+    "enabled": true,
+    "maxOverflowRetries": 1,
+    "retainBudget": 0.16,
+    "summarizationMaxTokens": 8192,
+    "summarizationModel": null,
+    "thresholdRatio": 0.8
+  },
   "instructionsPath": "agents/support/instructions.md",
   "instructionsSha256": "bcb2e4dfd83cdddc52fae602d0119dccf6ab8f40f67428236c528166877dbdff",
   "limits": {
@@ -9,6 +17,7 @@
     "maxTurns": 12
   },
   "model": {
+    "contextWindow": null,
     "maxTokens": 1024,
     "name": "claude-3-5-haiku-20241022",
     "provider": "anthropic"

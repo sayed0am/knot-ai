@@ -68,6 +68,7 @@ class AgentHarnessConfig:
     spill_sink: SpillSink | None = None
     default_question_ttl_seconds: int | None = None
     pre_request_hook: Callable[[Sequence[AgentMessage]], Awaitable[None]] | None = None
+    pre_turn_hook: Callable[[list[AgentMessage]], Awaitable[Sequence[AgentEvent]]] | None = None
 
 
 class AgentHarness:
@@ -243,6 +244,7 @@ class AgentHarness:
                 spill_sink=self._config.spill_sink,
                 default_question_ttl_seconds=self._config.default_question_ttl_seconds,
                 pre_request_hook=self._config.pre_request_hook,
+                pre_turn_hook=self._config.pre_turn_hook,
             ):
                 if isinstance(event, AgentEndEvent):
                     self._pending_requests = (

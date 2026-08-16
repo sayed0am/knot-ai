@@ -146,6 +146,32 @@ class SubagentCompletedEvent(WireModel):
     outcome: str
 
 
+class CompactionEvent(WireModel):
+    """A compaction just ran during this run — a control-plane event, not a
+    durable fact: ``PersistenceSubscriber`` ignores it by construction (it
+    only matches ``MessageEndEvent``/``AgentEndEvent``), the same way
+    ``SubagentCalledEvent``/``SubagentCompletedEvent`` do. The durable
+    record is the ``"compaction"`` session entry (see
+    ``knot.core.session.entries.Compaction``), appended before this event is
+    emitted; this is only the stream-side announcement of that fact, so a
+    live consumer (the HTTP/SSE layer) can render what happened without
+    re-deriving it from the log.
+
+    ``covers_through_seq`` mirrors the durable entry's own field: the
+    highest entry ``seq`` this compaction replaced. ``summary_bytes`` is the
+    UTF-8 byte length of the summary message's text, a cheap size signal for
+    a consumer that doesn't want to inspect the message itself.
+    ``trigger`` distinguishes a between-turns pressure check
+    (``"proactive"``) from a context-overflow retry (``"reactive"``); see
+    ``knot.authoring.runtime`` for both call sites.
+    """
+
+    type: Literal["compaction"] = "compaction"
+    covers_through_seq: int
+    summary_bytes: int
+    trigger: Literal["proactive", "reactive"]
+
+
 type AgentEvent = Annotated[
     AgentStartEvent
     | AgentEndEvent
@@ -158,7 +184,8 @@ type AgentEvent = Annotated[
     | ToolExecutionUpdateEvent
     | ToolExecutionEndEvent
     | SubagentCalledEvent
-    | SubagentCompletedEvent,
+    | SubagentCompletedEvent
+    | CompactionEvent,
     Field(discriminator="type"),
 ]
 
@@ -166,6 +193,7 @@ __all__ = [
     "AgentEndEvent",
     "AgentEvent",
     "AgentStartEvent",
+    "CompactionEvent",
     "MessageEndEvent",
     "MessageStartEvent",
     "MessageUpdateEvent",

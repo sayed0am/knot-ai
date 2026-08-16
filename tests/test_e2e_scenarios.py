@@ -14,16 +14,56 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from authoring_fixtures import write_files
 from server_fixtures import client_for, make_app, parse_sse
 
 from knot.authoring.compile import compile_fleet
+from knot.core.session.entries import ENTRY_TYPE_COMPACTION, ENTRY_TYPE_MESSAGE
 from knot.core.session.state import derive_state
 from knot.core.session.store import SessionStore
-from knot.providers.fake import FakeProvider, reply, tool_call
-from knot.providers.messages import ToolResultMessage
+from knot.providers.fake import FakeProvider, error, reply, tool_call
+from knot.providers.messages import ToolResultMessage, Usage
 from knot.server.app import create_app
 
 _FLEET_ROOT = Path(__file__).resolve().parent.parent / "examples" / "fleet"
+
+# Long filler text, matching tests/test_authoring_compaction.py's approach:
+# long enough that the compaction engine's per-message token estimate finds
+# a real boundary to cut at with a small `context_window`.
+_LONG_A = "x" * 400
+_LONG_B = "y" * 400
+
+_COMPACTION_AGENT_YAML = """
+    model:
+      provider: anthropic
+      name: some-model
+      context_window: 1000
+    compaction:
+      enabled: true
+      threshold_ratio: {threshold_ratio}
+      retain_budget: {retain_budget}
+      max_overflow_retries: {max_overflow_retries}
+"""
+
+
+def _compaction_fleet(
+    root: Path,
+    *,
+    threshold_ratio: float = 0.5,
+    retain_budget: float = 0.05,
+    max_overflow_retries: int = 1,
+) -> None:
+    write_files(
+        root,
+        {
+            "agents/root/instructions.md": "you are root\n",
+            "agents/root/agent.yaml": _COMPACTION_AGENT_YAML.format(
+                threshold_ratio=threshold_ratio,
+                retain_budget=retain_budget,
+                max_overflow_retries=max_overflow_retries,
+            ),
+        },
+    )
 
 
 def _pending_request_id(events: list[tuple[str, dict]]) -> str:
@@ -490,3 +530,231 @@ async def test_scenario_oversized_result_spills_is_retrieved_and_survives_restar
 
         final = (await client2.get(f"/sessions/{session_id}")).json()
         assert final["state"] == "idle"
+
+
+# ---------------------------------------------------------------------------
+# Scenario 6: proactive compaction crosses the threshold, parks, and
+# survives a restart with its audit trail intact
+# ---------------------------------------------------------------------------
+
+
+async def test_scenario_compaction_crosses_threshold_then_parks_and_survives_restart(
+    tmp_path: Path,
+) -> None:
+    """A purpose-built, tiny fleet (small ``context_window`` — the
+    committed ``examples/fleet`` has none, so it can never trigger proactive
+    compaction) scripts usage that crosses the configured threshold on turn
+    2. Turn 3's pre-turn hook fires: a ``compaction`` SSE frame appears, the
+    durable log gains a ``compaction`` entry (task 7.1/2), and the next
+    provider request is built from the compacted history (summary message
+    first). Turn 3 then parks on ``ask_user``. A simulated restart (fresh
+    app + store over the same sqlite file) shows the same park, and the
+    resumed session's derived history is byte-for-byte identical to what it
+    was right before the restart — the strict model-visible-logged invariant
+    (already asserted by ``runtime_kwargs`` default in ``make_app``/``app2``
+    below) proves it, and this test also checks it directly (task 8.1). The
+    raw entry log still carries every pre-compaction message entry,
+    unmodified, alongside the one compaction entry (task 8.3)."""
+    db_path = str(tmp_path / "knot.db")
+    _compaction_fleet(tmp_path, threshold_ratio=0.5, retain_budget=0.05)
+
+    provider1 = FakeProvider(
+        [
+            reply(_LONG_B),  # turn 1: ordinary completion, below threshold
+            reply("ack two", usage=Usage(input=600)),  # turn 2: crosses 0.5 * 1000 = 500
+            reply("<summary of turns one and two>"),  # turn 3's pre-turn summarization call
+            tool_call(
+                "ask_user", {"question": "confirm before I proceed?"}, id="call_ask"
+            ),  # turn 3's real request, built from the compacted history -- parks
+        ]
+    )
+    app1 = make_app(tmp_path, [], db_path=db_path, provider=provider1)
+
+    async with client_for(app1) as client1:
+        session_id = (await client1.post("/agents/root/sessions")).json()["sessionId"]
+
+        s1 = await client1.post(f"/sessions/{session_id}/messages", json={"text": _LONG_A})
+        assert parse_sse(s1.text)[-1][1]["outcome"] == "completed"
+
+        s2 = await client1.post(f"/sessions/{session_id}/messages", json={"text": "two"})
+        events2 = parse_sse(s2.text)
+        assert events2[-1][1]["outcome"] == "completed"
+        assert not any(etype == "compaction" for etype, _ in events2)  # not yet -- lagged a turn
+
+        s3 = await client1.post(f"/sessions/{session_id}/messages", json={"text": "three"})
+        events3 = parse_sse(s3.text)
+
+        compaction_frames = [data for etype, data in events3 if etype == "compaction"]
+        assert len(compaction_frames) == 1
+        assert compaction_frames[0]["trigger"] == "proactive"
+        assert compaction_frames[0]["summaryBytes"] > 0
+        assert isinstance(compaction_frames[0]["coversThroughSeq"], int)
+
+        end_type, end_data = events3[-1]
+        assert end_type == "agent_end"
+        assert end_data["outcome"] == "waiting_input"
+        assert end_data["pendingRequests"][0]["kind"] == "question"
+        request_id = end_data["pendingRequests"][0]["id"]
+
+        # The NEXT provider request (turn 3's real, post-summarization
+        # request) starts with the `<compacted-summary>` message.
+        third_request_messages = provider1.calls[-1][2]
+        assert third_request_messages[0].text.startswith("<compacted-summary>")
+
+        pre_restart_entries = app1.state.knot.store.entries(session_id)
+        pre_restart_derived = derive_state(pre_restart_entries)
+        assert pre_restart_derived.messages[0].text.startswith("<compacted-summary>")
+
+        # -- 8.3: audit trail preserved -- every pre-compaction message
+        #         entry is still present in the raw log, unmodified,
+        #         alongside the compaction entry itself.
+        compaction_entries = [e for e in pre_restart_entries if e.type == ENTRY_TYPE_COMPACTION]
+        assert len(compaction_entries) == 1
+        message_entries = [e for e in pre_restart_entries if e.type == ENTRY_TYPE_MESSAGE]
+        covers_through_seq = compaction_entries[0].payload["coversThroughSeq"]
+        pre_compaction_messages = [e for e in message_entries if e.seq <= covers_through_seq]
+        retained_messages = [e for e in message_entries if e.seq > covers_through_seq]
+        # At least turn 1's exchange predates the compaction entry and must
+        # still be there verbatim; some tail of history was also retained
+        # uncompacted (the whole point of a "retained tail").
+        assert len(pre_compaction_messages) >= 2
+        assert len(retained_messages) >= 1
+        assert pre_compaction_messages[0].payload["content"] == _LONG_A
+
+    # -- simulated restart: fresh app + store over the same sqlite file ----
+    app1.state.knot.store.close()
+    fleet2 = compile_fleet(tmp_path)
+    store2 = SessionStore(db_path)
+    # The retained tail still carries turn 2's exchange (select_boundary
+    # never lands the boundary after the most recent persisted user
+    # message), and that's exactly the exchange whose usage crossed the
+    # threshold -- so continuing may legitimately fire the proactive hook a
+    # second time. Two scripts cover both possibilities: a (possibly
+    # rejected) second summarization attempt, then the real reply.
+    provider2 = FakeProvider(
+        [reply("<a second summary, if one is attempted>"), reply("noted, thanks")]
+    )
+    app2 = create_app(
+        fleet=fleet2,
+        store=store2,
+        provider=provider2,
+        runtime_kwargs={"invariant_mode": "strict"},
+    )
+
+    async with client_for(app2) as client2:
+        got = await client2.get(f"/sessions/{session_id}")
+        assert got.status_code == 200
+        body = got.json()
+        assert body["state"] == "waiting"
+        assert body["pendingRequests"][0]["id"] == request_id
+
+        # 8.1: the resumed session's derived history equals the pre-restart
+        # post-compaction history -- exactly (role, text) for role, text.
+        resumed_derived = derive_state(store2.entries(session_id))
+        assert [(m.role, m.text) for m in resumed_derived.messages] == [
+            (m.role, m.text) for m in pre_restart_derived.messages
+        ]
+
+        resolved = await client2.post(
+            f"/sessions/{session_id}/input",
+            json={"responses": {request_id: {"action": "answer", "by": "ops", "text": "yes"}}},
+        )
+        assert resolved.status_code == 200
+        assert resolved.json()["readyToContinue"] is True
+
+        cont = await client2.post(f"/sessions/{session_id}/continue")
+        assert cont.status_code == 200
+        cont_events = parse_sse(cont.text)
+        assert cont_events[-1][1]["outcome"] == "completed"
+        assert cont_events[-1][1]["messages"][-1]["content"][0]["text"] == "noted, thanks"
+
+        final = (await client2.get(f"/sessions/{session_id}")).json()
+        assert final["state"] == "idle"
+
+
+# ---------------------------------------------------------------------------
+# Scenario 7: reactive compact-and-retry recovers from a context-overflow
+# error; a second run with retries exhausted surfaces the original error
+# ---------------------------------------------------------------------------
+
+
+async def test_scenario_reactive_compaction_recovers_then_exhausts_retries(
+    tmp_path: Path,
+) -> None:
+    """First run: a scripted context-overflow error is recovered from --
+    the stream shows a ``compaction`` frame followed by the retried
+    request's events, and exactly ONE terminal ``agent_end`` (outcome
+    ``completed``): the overflow error's own terminal is withheld, never
+    reaching the client, per design D3/``_drive_with_reactive_compaction``.
+    Second run (a fresh, isolated fleet+session so the retry cap starts
+    fresh): retries are exhausted, so the run's one and only terminal is the
+    original error outcome, and the SSE stream still ends cleanly (task
+    8.2)."""
+    recover_root = tmp_path / "recovers"
+    _compaction_fleet(recover_root, threshold_ratio=0.99, retain_budget=0.1, max_overflow_retries=1)
+
+    provider1 = FakeProvider(
+        [
+            reply(_LONG_B),  # turn 1: ordinary success, builds up history
+            error("context window exceeded", error_type="context_overflow"),  # turn 2 overflows
+            reply("<summary>"),  # the reactive summarization call
+            reply("ack two"),  # the retried request succeeds
+        ]
+    )
+    app1 = make_app(recover_root, [], provider=provider1)
+
+    async with client_for(app1) as client1:
+        session_id = (await client1.post("/agents/root/sessions")).json()["sessionId"]
+
+        s1 = await client1.post(f"/sessions/{session_id}/messages", json={"text": _LONG_A})
+        assert parse_sse(s1.text)[-1][1]["outcome"] == "completed"
+
+        s2 = await client1.post(f"/sessions/{session_id}/messages", json={"text": "two"})
+        assert s2.status_code == 200
+        events2 = parse_sse(s2.text)
+
+        end_frames = [data for etype, data in events2 if etype == "agent_end"]
+        assert len(end_frames) == 1  # the overflow error terminal was withheld
+        assert end_frames[0]["outcome"] == "completed"
+        assert end_frames[0]["messages"][-1]["content"][0]["text"] == "ack two"
+
+        compaction_frames = [data for etype, data in events2 if etype == "compaction"]
+        assert len(compaction_frames) == 1
+        assert compaction_frames[0]["trigger"] == "reactive"
+
+        # The compaction frame appears before the retried request's own
+        # events, so the client sees one continuous recovered run.
+        compaction_index = next(i for i, (etype, _) in enumerate(events2) if etype == "compaction")
+        end_index = next(i for i, (etype, _) in enumerate(events2) if etype == "agent_end")
+        assert compaction_index < end_index
+
+    # -- second, isolated run: retries exhausted -> the error stands -------
+    exhaust_root = tmp_path / "exhausts"
+    _compaction_fleet(exhaust_root, threshold_ratio=0.99, retain_budget=0.1, max_overflow_retries=1)
+
+    provider2 = FakeProvider(
+        [
+            reply(_LONG_B),  # turn 1: builds history
+            error("overflow again", error_type="context_overflow"),  # first overflow
+            reply("<summary>"),  # compaction succeeds once
+            error("still overflowing", error_type="context_overflow"),  # retry overflows too
+        ]
+    )
+    app2 = make_app(exhaust_root, [], provider=provider2)
+
+    async with client_for(app2) as client2:
+        session_id2 = (await client2.post("/agents/root/sessions")).json()["sessionId"]
+
+        s1b = await client2.post(f"/sessions/{session_id2}/messages", json={"text": _LONG_A})
+        assert parse_sse(s1b.text)[-1][1]["outcome"] == "completed"
+
+        s2b = await client2.post(f"/sessions/{session_id2}/messages", json={"text": "two"})
+        assert s2b.status_code == 200  # the stream still terminates cleanly, even on failure
+        events2b = parse_sse(s2b.text)
+
+        end_frames_b = [data for etype, data in events2b if etype == "agent_end"]
+        assert len(end_frames_b) == 1  # exactly one terminal -- no further retry beyond the cap
+        assert end_frames_b[0]["outcome"] == "error"
+
+        compaction_frames_b = [data for etype, data in events2b if etype == "compaction"]
+        assert len(compaction_frames_b) == 1  # the cap allowed exactly one compaction attempt

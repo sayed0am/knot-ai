@@ -116,6 +116,7 @@ async def run_agent_loop(
     spill_sink: SpillSink | None = None,
     default_question_ttl_seconds: int | None = None,
     pre_request_hook: Callable[[Sequence[AgentMessage]], Awaitable[None]] | None = None,
+    pre_turn_hook: Callable[[list[AgentMessage]], Awaitable[Sequence[AgentEvent]]] | None = None,
 ) -> AsyncIterator[AgentEvent]:
     """Run the provider/tool loop, emitting the core agent event grammar.
 
@@ -137,6 +138,19 @@ async def run_agent_loop(
     ``HistoryDivergenceError`` is treated like any other fatal turn error:
     it ends the run through the same error-outcome path, before any
     provider call is made — no new outcome kind.
+
+    ``pre_turn_hook``, when given, is awaited exactly once at the start of
+    every turn, right where ``TurnStartEvent`` is emitted — before
+    ``pre_request_hook``, before this turn's steering messages are drained,
+    and before the ``max_turns`` check. It receives the loop's own live
+    ``messages`` list (not a copy) and may mutate it in place; this is how
+    context compaction (``knot.authoring.runtime``) rewrites history
+    between turns — the loop itself stays pure and knows nothing about why.
+    Any events the hook returns are yielded immediately, ahead of that
+    turn's own events. Unlike tool-phase control events (see
+    ``emit_loop_event``), a pre-turn hook runs outside the tool phase's
+    queue context, so it cannot use ``emit_loop_event``; returning its
+    events directly is the only channel it has.
     """
     new_messages = list(prompts)
     if prompts:
@@ -144,6 +158,8 @@ async def run_agent_loop(
 
     yield AgentStartEvent()
     yield TurnStartEvent()
+    async for event in _run_pre_turn_hook(pre_turn_hook, messages):
+        yield event
     for message in prelude_messages:
         yield MessageStartEvent(message=message)
         yield MessageEndEvent(message=message)
@@ -168,6 +184,8 @@ async def run_agent_loop(
         while has_more_tools or pending:
             if not first_turn:
                 yield TurnStartEvent()
+                async for event in _run_pre_turn_hook(pre_turn_hook, messages):
+                    yield event
             first_turn = False
 
             for message in pending:
@@ -283,6 +301,22 @@ async def run_agent_loop(
         break
 
     yield AgentEndEvent(outcome="completed", messages=new_messages, pending_requests=[])
+
+
+async def _run_pre_turn_hook(
+    pre_turn_hook: Callable[[list[AgentMessage]], Awaitable[Sequence[AgentEvent]]] | None,
+    messages: list[AgentMessage],
+) -> AsyncIterator[AgentEvent]:
+    """Await ``pre_turn_hook`` (a no-op when ``None``) and yield its events.
+
+    A tiny wrapper rather than an inline ``if`` at each of the two
+    ``TurnStartEvent`` call sites (see ``run_agent_loop``'s docstring for
+    why there are two), so both sites stay identical one-liners.
+    """
+    if pre_turn_hook is None:
+        return
+    for event in await pre_turn_hook(messages):
+        yield event
 
 
 async def _assistant_events(

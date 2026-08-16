@@ -21,6 +21,7 @@ from collections.abc import AsyncIterator, Mapping, Sequence
 from json import dumps
 from typing import Any
 
+from knot.providers._http_errors import classify_provider_error_type
 from knot.providers._provider_events import (
     ProviderAbortedEvent,
     ProviderErrorEvent,
@@ -35,7 +36,7 @@ from knot.providers._retry import (
 )
 from knot.providers._stream import canonicalize_provider_stream
 from knot.providers.events import AssistantMessageEvent
-from knot.providers.messages import AgentMessage
+from knot.providers.messages import AgentMessage, ErrorType
 from knot.providers.openai_compatible import (
     _ChatStreamParser,
     _messages_to_openai_chat,
@@ -177,6 +178,7 @@ class LiteLLMProvider:
                     yield ProviderErrorEvent(
                         message=str(exc),
                         data={"error_type": type(exc).__name__, "attempts": attempt + 1},
+                        error_type=_classify_litellm_exception(exc),
                     )
                     return
 
@@ -209,7 +211,9 @@ class LiteLLMProvider:
                             return
                         continue
                     yield ProviderErrorEvent(
-                        message=str(exc), data={"attempts": attempt + 1}
+                        message=str(exc),
+                        data={"attempts": attempt + 1},
+                        error_type=_classify_litellm_exception(exc),
                     )
                     return
 
@@ -232,6 +236,34 @@ def _is_transient_litellm_error(exc: Exception) -> bool:
     if isinstance(status_code, int):
         return is_transient_status(status_code)
     return type(exc).__name__ in _TRANSIENT_LITELLM_EXCEPTION_NAMES
+
+
+_LITELLM_CONTEXT_OVERFLOW_EXCEPTION_NAMES = frozenset({"ContextWindowExceededError"})
+_LITELLM_RATE_LIMIT_EXCEPTION_NAMES = frozenset({"RateLimitError"})
+
+
+def _classify_litellm_exception(exc: Exception) -> ErrorType:
+    """Best-effort classification of a LiteLLM-raised exception.
+
+    LiteLLM normalizes every backend's errors into its own typed exception
+    hierarchy (``litellm.ContextWindowExceededError``,
+    ``litellm.RateLimitError``, ...), so the exception's class name is the
+    most reliable signal — checked by name rather than ``isinstance`` so this
+    module never needs to import ``litellm`` eagerly (see the module
+    docstring). Falls back to the shared HTTP-shaped heuristic against the
+    exception's status code and message, then to ``"other"`` when nothing
+    matches — this is explicitly best-effort per the design.
+    """
+    name = type(exc).__name__
+    if name in _LITELLM_CONTEXT_OVERFLOW_EXCEPTION_NAMES:
+        return "context_overflow"
+    if name in _LITELLM_RATE_LIMIT_EXCEPTION_NAMES:
+        return "rate_limit"
+    status_code = getattr(exc, "status_code", None)
+    return classify_provider_error_type(
+        status_code=status_code if isinstance(status_code, int) else None,
+        body=str(exc),
+    )
 
 
 def _chunk_to_dict(chunk: Any) -> dict[str, Any]:

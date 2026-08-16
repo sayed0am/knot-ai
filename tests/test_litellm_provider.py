@@ -133,6 +133,68 @@ async def test_provider_constructs_and_streams_when_litellm_available(
     assert captured_kwargs["stream"] is True
 
 
+async def test_context_window_exceeded_exception_is_classified(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class ContextWindowExceededError(Exception):
+        pass
+
+    async def fake_acompletion(**kwargs):
+        raise ContextWindowExceededError("context window exceeded")
+
+    _install_fake_litellm(monkeypatch, fake_acompletion)
+    provider = litellm_adapter.LiteLLMProvider(max_retries=0)
+    events = await _collect(
+        provider.stream_response(
+            model="gpt-4o-mini", system="s", messages=[UserMessage(content="hi")], tools=[]
+        )
+    )
+
+    from knot.providers.events import AssistantErrorEvent
+
+    assert isinstance(events[-1], AssistantErrorEvent)
+    assert events[-1].error.error_type == "context_overflow"
+
+
+async def test_rate_limit_exception_is_classified(monkeypatch: pytest.MonkeyPatch) -> None:
+    class RateLimitError(Exception):
+        pass
+
+    async def fake_acompletion(**kwargs):
+        raise RateLimitError("rate limited")
+
+    _install_fake_litellm(monkeypatch, fake_acompletion)
+    provider = litellm_adapter.LiteLLMProvider(max_retries=0)
+    events = await _collect(
+        provider.stream_response(
+            model="gpt-4o-mini", system="s", messages=[UserMessage(content="hi")], tools=[]
+        )
+    )
+
+    from knot.providers.events import AssistantErrorEvent
+
+    assert isinstance(events[-1], AssistantErrorEvent)
+    assert events[-1].error.error_type == "rate_limit"
+
+
+async def test_unclassifiable_exception_is_other(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def fake_acompletion(**kwargs):
+        raise ValueError("something else went wrong")
+
+    _install_fake_litellm(monkeypatch, fake_acompletion)
+    provider = litellm_adapter.LiteLLMProvider(max_retries=0)
+    events = await _collect(
+        provider.stream_response(
+            model="gpt-4o-mini", system="s", messages=[UserMessage(content="hi")], tools=[]
+        )
+    )
+
+    from knot.providers.events import AssistantErrorEvent
+
+    assert isinstance(events[-1], AssistantErrorEvent)
+    assert events[-1].error.error_type == "other"
+
+
 async def test_provider_streams_tool_calls(monkeypatch: pytest.MonkeyPatch) -> None:
     async def fake_acompletion(**kwargs):
         return _FakeStream(

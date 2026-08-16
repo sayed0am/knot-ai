@@ -746,6 +746,7 @@ def compile_agent(discovery: AgentDiscovery, fleet: FleetContext) -> CompiledAge
         instructions_sha256=instructions_sha256,
         model=config.model,
         limits=config.limits,
+        compaction=config.compaction,
         tools=manifest_tools,
         skills=manifest_skills,
         subagent_ids=subagent_ids,

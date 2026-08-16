@@ -238,6 +238,7 @@ the wire.
 | `turn_end` | `message, toolResults` | One model turn's assistant message plus any tool results produced for it. |
 | `subagent_called` | `toolCallId, subagentId, childSessionId` | A delegation call just created a child session — control-plane only, not durably recorded. |
 | `subagent_completed` | `toolCallId, subagentId, childSessionId, outcome` | That child session reached *some* terminal state for this call — `outcome` is the child's own `agent_end.outcome`, including `"waiting_input"` if the child itself parked. |
+| `compaction` | `coversThroughSeq, summaryBytes, trigger` | The session's history was just compacted — see [Context compaction](#context-compaction) below. Control-plane only, like `subagent_called`; the durable fact is the `"compaction"` session entry, already appended by the time this frame is sent. |
 | `agent_end` | `outcome, messages, pendingRequests` | **Always the last `AgentEvent` frame.** `outcome` is `"completed"`, `"error"`, `"aborted"`, or `"waiting_input"`. |
 | `chain` | `parentSessionId, parentReady` | Server-layer-only frame (not part of the core event grammar) — see [Delegation and the chain event](#delegation-and-the-chain-event) below. |
 
@@ -334,6 +335,73 @@ itself returned) and its content is untouched — spilling only ever replaces
 a result that would otherwise exceed the cap, and the replacement is always
 within it.
 
+## Context compaction
+
+A long-lived session can outgrow its model's context window. When that
+happens, knot durably replaces the oldest span of the conversation with a
+single model-generated summary message (see `docs/authoring-agents.md`'s
+`compaction:` block for the full trigger/config surface) and announces it on
+the stream with a `compaction` frame:
+
+```
+event: compaction
+data: {"type":"compaction","coversThroughSeq":1,"summaryBytes":96,"trigger":"proactive"}
+```
+
+- `coversThroughSeq` — the highest durable entry `seq` this compaction
+  replaced (an internal log coordinate, not a transcript index — useful for
+  correlating with the raw entry log, not for indexing `transcript`).
+- `summaryBytes` — the UTF-8 byte length of the summary text, a cheap size
+  signal if you don't want to inspect the message itself.
+- `trigger` — `"proactive"` (fired between turns, before the next provider
+  request, because reported context usage crossed the configured
+  threshold) or `"reactive"` (fired in response to a provider context-
+  overflow error — see below).
+
+Once compaction runs, the summary message is an ordinary part of
+`transcript`/`agent_end.messages` going forward — a `user`-role message
+whose text is wrapped in `<compacted-summary>...</compacted-summary>` tags,
+so a client can recognize and render it distinctly from words the human
+user actually typed. The messages it replaced are never removed from the
+session's durable log — only from the model-visible projection — so nothing
+about the API surface *requires* a client to do anything special with a
+`compaction` frame; it's purely informational.
+
+### Reactive recovery: the stream shape
+
+When a provider request fails with a context-overflow error, knot compacts
+and retries automatically instead of ending the run with that error — the
+client sees one continuous run, never a mid-stream error terminal for a run
+that in fact recovered. Concretely: the failed request's own
+`message_end` still appears on the stream (with `stopReason: "error"` and
+`errorType: "context_overflow"`), but the `agent_end` frame that would
+normally follow it is **withheld** — replaced by a `compaction` frame and
+then the retried request's own events — so the stream carries exactly one
+terminal `agent_end` for the whole turn:
+
+```
+event: message_end
+data: {"type":"message_end","message":{"role":"assistant","content":[],...,"stopReason":"error","errorMessage":"context window exceeded","errorType":"context_overflow",...}}
+
+event: compaction
+data: {"type":"compaction","coversThroughSeq":1,"summaryBytes":76,"trigger":"reactive"}
+
+event: message_end
+data: {"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"Continuing after recovery.",...}],...,"stopReason":"stop",...}}
+
+event: agent_end
+data: {"type":"agent_end","outcome":"completed","messages":[{"role":"assistant","content":[{"type":"text","text":"Continuing after recovery."}],...}],"pendingRequests":[]}
+```
+
+If compaction cannot shrink the history, or the configured
+`max_overflow_retries` is exhausted, recovery does not happen: the withheld
+`agent_end` is yielded as the run's one and only terminal, with its original
+`outcome: "error"` — the stream still ends cleanly (a `None` sentinel closes
+it the same as any other run), it simply never recovered. A client that
+only ever looks at the terminal `agent_end` needs no special handling
+either way; the `compaction` frame is only there for a client that wants to
+render "the session was summarized" to a human.
+
 ## Delegation and the chain event
 
 A delegation call (a subagent tool call) either returns the child's answer
@@ -382,7 +450,10 @@ continue its parent, and so on up to the root.
 `AgentMessage` (used in `transcript`, `agent_end.messages`, and every
 `message_*` event) is a discriminated union on `role`:
 
-- **`user`** — `{"role": "user", "content": "<text>", "timestamp": ...}`.
+- **`user`** — `{"role": "user", "content": "<text>", "timestamp": ...}`. A
+  compaction summary (see [Context compaction](#context-compaction) above)
+  is also a `user`-role message, distinguishable by its
+  `<compacted-summary>...</compacted-summary>`-wrapped `content`.
 - **`assistant`** — `{"role": "assistant", "content": [TextContent | ThinkingContent | ToolCall, ...], "api", "provider", "model", "usage", "stopReason", "errorMessage", "timestamp", ...}`. A `ToolCall` content block is `{"type": "toolCall", "id", "name", "arguments"}`.
 - **`toolResult`** — `{"role": "toolResult", "toolCallId", "toolName", "content": [...], "details", "isError", "timestamp"}`. This is what a delegation call's result looks like in the *parent's* transcript too: `toolName` is the subagent's id, and `content` is the child's final answer text. `details` is normally `null`; for a spilled result it is `{"spilled": true, "original_bytes", "ref"}` and `content` is the bounded preview, never the full text — see [An oversized result, spilled](#an-oversized-result-spilled) above.
 - **`custom`** — an escape hatch for provider-specific message shapes; not produced by anything described in this document.

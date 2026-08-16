@@ -19,6 +19,19 @@ matching ``ToolResultMessage`` yet) are intentionally left unrepaired here.
 That repair already happens once, deterministically, when
 ``AgentHarness`` starts its next run (see ``AgentHarness._run``), and
 duplicating it here would just be a second place for the two to drift.
+
+Compaction folding: a ``"compaction"`` entry does not add a message of its
+own to the accumulated list. Instead it drops every accumulated message
+whose *originating* entry ``seq`` is ``<= covers_through_seq`` and prepends
+its ``summary_message`` in their place, tracked internally under the
+compaction entry's own ``seq``. Tracking the summary under its own entry's
+seq (rather than, say, the seq of the span it replaces) is what makes
+repeated compactions compose for free: a later compaction's
+``covers_through_seq`` is simply a higher number, and since it is
+necessarily >= the earlier compaction entry's own seq, folding it drops the
+prior summary right along with the rest of the span it now also covers —
+no special-casing needed to detect "this accumulated message is itself a
+prior summary".
 """
 
 from __future__ import annotations
@@ -32,9 +45,11 @@ from knot.core.harness import AgentHarness, AgentHarnessConfig
 from knot.providers.messages import AgentMessage
 
 from .entries import (
+    ENTRY_TYPE_COMPACTION,
     ENTRY_TYPE_INPUT_REQUESTED,
     ENTRY_TYPE_INPUT_RESOLVED,
     ENTRY_TYPE_MESSAGE,
+    entry_to_compaction,
     entry_to_message,
     entry_to_request,
     entry_to_resolution,
@@ -51,23 +66,45 @@ class DerivedState:
     status: SessionStatus
     pending_requests: tuple[PendingInputRequest, ...]
     messages: tuple[AgentMessage, ...]
+    #: The originating entry ``seq`` for each element of ``messages``, in
+    #: the same order — ``message_seqs[i]`` is the durable coordinate
+    #: ``messages[i]`` was folded from (see the module docstring's
+    #: "Compaction folding" note: a summary message is tracked under its own
+    #: compaction entry's seq, not the seq of the span it replaced). Context
+    #: compaction (``knot.core.compaction``) needs this seq-aligned view to
+    #: select a boundary in terms of the store's own stable coordinate
+    #: rather than a message index that shifts as later compactions land.
+    #: Defaults to ``()`` only for backward-compatible direct construction;
+    #: ``derive_state`` always fills it in aligned 1:1 with ``messages``.
+    message_seqs: tuple[int, ...] = ()
 
 
 def derive_state(entries: Sequence[Entry]) -> DerivedState:
     """Compute ``DerivedState`` from a session's entries, in log order."""
-    messages: list[AgentMessage] = []
+    # Each accumulated message is tracked with the seq of the entry it
+    # originated from, so a later "compaction" entry can drop the covered
+    # span by seq (see the module docstring's "Compaction folding" note).
+    # This bookkeeping is purely internal — DerivedState.messages stays a
+    # plain message tuple.
+    messages: list[tuple[int, AgentMessage]] = []
     requested: dict[str, PendingInputRequest] = {}
     resolved_request_ids: set[str] = set()
 
     for entry in entries:
         if entry.type == ENTRY_TYPE_MESSAGE:
-            messages.append(entry_to_message(entry))
+            messages.append((entry.seq, entry_to_message(entry)))
         elif entry.type == ENTRY_TYPE_INPUT_REQUESTED:
             request = entry_to_request(entry)
             requested[request.id] = request
         elif entry.type == ENTRY_TYPE_INPUT_RESOLVED:
             resolution = entry_to_resolution(entry)
             resolved_request_ids.add(resolution.request_id)
+        elif entry.type == ENTRY_TYPE_COMPACTION:
+            compaction = entry_to_compaction(entry)
+            messages = [
+                (seq, message) for seq, message in messages if seq > compaction.covers_through_seq
+            ]
+            messages.insert(0, (entry.seq, compaction.summary_message))
         # Unknown entry types are ignored rather than raising: durable
         # history should stay readable by older code as new entry types
         # are introduced.
@@ -78,7 +115,12 @@ def derive_state(entries: Sequence[Entry]) -> DerivedState:
         if request_id not in resolved_request_ids
     )
     status: SessionStatus = "waiting" if pending else "idle"
-    return DerivedState(status=status, pending_requests=pending, messages=tuple(messages))
+    return DerivedState(
+        status=status,
+        pending_requests=pending,
+        messages=tuple(message for _, message in messages),
+        message_seqs=tuple(seq for seq, _ in messages),
+    )
 
 
 def rehydrate(store: SessionStore, session_id: str) -> DerivedState:

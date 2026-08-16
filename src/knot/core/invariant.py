@@ -72,7 +72,7 @@ _ENTRY_TYPE_MESSAGE = "message"
 # `ToolResultMessage` additionally drop fields specific to them.
 PROVIDER_INVISIBLE_FIELDS: Mapping[type[AgentMessage], frozenset[str]] = {
     UserMessage: frozenset({"timestamp"}),
-    AssistantMessage: frozenset({"timestamp", "usage", "diagnostics", "response_id"}),
+    AssistantMessage: frozenset({"timestamp", "usage", "diagnostics", "response_id", "error_type"}),
     ToolResultMessage: frozenset({"timestamp", "details"}),
     CustomMessage: frozenset({"timestamp"}),
 }

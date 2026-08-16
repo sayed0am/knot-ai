@@ -36,6 +36,7 @@ from knot.providers.events import (
 from knot.providers.messages import (
     AgentMessage,
     AssistantMessage,
+    ErrorType,
     TextContent,
     ThinkingContent,
     ToolCall,
@@ -130,15 +131,26 @@ def error(
     message: str,
     *,
     reason: Literal["error", "aborted"] = "error",
+    error_type: ErrorType | None = None,
     model: str = "fake-model",
     provider: str = "fake",
 ) -> list[AssistantMessageEvent]:
-    """Build an event sequence for a scripted error (or aborted) reply."""
+    """Build an event sequence for a scripted error (or aborted) reply.
+
+    ``error_type`` lets a test script a specific classification (e.g.
+    ``"context_overflow"``) so reactive-compaction and other error_type-
+    dependent code paths can be driven end to end without a real provider.
+    Defaults to ``None``, matching a plain, unclassified error/aborted reply
+    (unclassified is fine here since a script author who cares always passes
+    it explicitly; the *adapters* are the ones bound by the "never None for
+    a real error" contract on ``AssistantMessage.error_type``).
+    """
     partial = AssistantMessage(api="fake", provider=provider, model=model)
     start = AssistantStartEvent(partial=partial.model_copy(deep=True))
     failed = partial.model_copy(deep=True)
     failed.stop_reason = reason  # type: ignore[assignment]
     failed.error_message = message
+    failed.error_type = error_type
     return [start, AssistantErrorEvent(reason=reason, error=failed)]
 
 

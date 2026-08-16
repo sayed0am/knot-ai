@@ -19,7 +19,7 @@ from typing import Any, cast
 import httpx
 
 from knot.providers._http import create_async_client
-from knot.providers._http_errors import provider_http_error_message
+from knot.providers._http_errors import classify_provider_error_type, provider_http_error_message
 from knot.providers._provider_events import (
     ProviderAbortedEvent,
     ProviderErrorEvent,
@@ -42,6 +42,7 @@ from knot.providers.events import AssistantMessageEvent
 from knot.providers.messages import (
     AgentMessage,
     AssistantMessage,
+    ErrorType,
     ImageContent,
     TextContent,
     ThinkingContent,
@@ -199,6 +200,9 @@ class AnthropicProvider:
                                     "body": body_text,
                                     "attempts": attempt + 1,
                                 },
+                                error_type=classify_provider_error_type(
+                                    status_code=response.status_code, body=body_text
+                                ),
                             )
                             return
 
@@ -292,6 +296,9 @@ class AnthropicProvider:
                                 yield ProviderErrorEvent(
                                     message=message,
                                     data={"event": chunk, "attempts": attempt + 1},
+                                    error_type=_classify_anthropic_stream_error(
+                                        error_type, message
+                                    ),
                                 )
                                 return
 
@@ -315,8 +322,7 @@ class AnthropicProvider:
                             continue
 
                         tool_calls = [
-                            builder.build(index)
-                            for index, builder in sorted(tool_builders.items())
+                            builder.build(index) for index, builder in sorted(tool_builders.items())
                         ]
                         for tool_call in tool_calls:
                             yield ProviderToolCallEvent(tool_call=tool_call)
@@ -382,6 +388,20 @@ def _anthropic_stream_error_details(event: Mapping[str, JSONValue]) -> tuple[str
 def _retryable_anthropic_stream_error(error_type: str) -> bool:
     """Return whether an Anthropic SSE error is transient and safe to retry."""
     return error_type.lower() in _TRANSIENT_ANTHROPIC_STREAM_ERROR_TYPES
+
+
+def _classify_anthropic_stream_error(error_type: str, message: str) -> ErrorType:
+    """Classify a non-retryable mid-stream Anthropic SSE ``error`` event.
+
+    Mirrors ``classify_provider_error_type`` for the HTTP>=400 path, but this
+    error arrives as an SSE ``error`` event's ``type``/``message`` pair
+    rather than an HTTP status/body, so it can't reuse that helper directly.
+    """
+    if error_type.lower() == "rate_limit_error":
+        return "rate_limit"
+    if classify_provider_error_type(status_code=None, body=message) == "context_overflow":
+        return "context_overflow"
+    return "other"
 
 
 class _AnthropicToolBuilder:

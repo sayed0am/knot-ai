@@ -198,6 +198,7 @@ async def canonicalize_provider_stream(
             error.response_provider = event.response_provider or partial.response_provider
             error.stop_reason = "error"
             error.error_message = event.message
+            error.error_type = event.error_type
             error.diagnostics = [
                 AssistantMessageDiagnostic(type="provider_error", details=event.data)
             ]
@@ -220,5 +221,6 @@ async def canonicalize_provider_stream(
         error = partial.model_copy(deep=True)
         error.stop_reason = "error"
         error.error_message = "Provider stream ended without a terminal event"
+        error.error_type = "other"
         error.usage = Usage()
         yield AssistantErrorEvent(reason="error", error=error)

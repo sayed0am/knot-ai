@@ -112,7 +112,12 @@ def test_manifest_model_config_is_also_camel_case(tmp_path: Path) -> None:
     import json
 
     data = json.loads(serialize_manifest(manifest))
-    assert data["model"] == {"provider": "anthropic", "name": "some-model", "maxTokens": 4096}
+    assert data["model"] == {
+        "provider": "anthropic",
+        "name": "some-model",
+        "maxTokens": 4096,
+        "contextWindow": None,
+    }
     assert data["limits"]["maxTurns"] == 20
     assert data["limits"]["delegationMaxPerTurn"] == 2
     assert "max_tokens" not in data["model"]

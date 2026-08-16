@@ -458,6 +458,30 @@ async def test_provider_error_ends_run_with_error_outcome() -> None:
     assert end.outcome == "error"
 
 
+async def test_scripted_error_type_survives_a_full_run_agent_loop_drain() -> None:
+    """The fake provider's ``error(..., error_type=...)`` scripting helper
+    must yield an error AssistantMessage carrying that classification all
+    the way through a real ``run_agent_loop`` drain, not just through the
+    provider adapter layer in isolation."""
+    provider = FakeProvider([error("too much history", error_type="context_overflow")])
+
+    events = await _collect(
+        provider=provider,
+        model="m",
+        system="s",
+        messages=[],
+        tools=[],
+        prompts=[UserMessage(content="go")],
+    )
+
+    end = events[-1]
+    assert isinstance(end, AgentEndEvent)
+    assert end.outcome == "error"
+    error_message = end.messages[-1]
+    assert isinstance(error_message, AssistantMessage)
+    assert error_message.error_type == "context_overflow"
+
+
 async def test_provider_aborted_ends_run_with_aborted_outcome() -> None:
     provider = FakeProvider([error("stopped", reason="aborted")])
 
@@ -638,7 +662,5 @@ async def test_cancel_mid_tool_ends_aborted_and_history_is_rehydratable() -> Non
     report = repair_tool_history(messages)
     assert report.synthesized_results == 1
     assert report.changed is True
-    result_ids = {
-        m.tool_call_id for m in report.messages if isinstance(m, ToolResultMessage)
-    }
+    result_ids = {m.tool_call_id for m in report.messages if isinstance(m, ToolResultMessage)}
     assert result_ids == {"call_slow", "call_fast"}

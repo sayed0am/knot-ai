@@ -238,7 +238,13 @@ def _stream_turn(
     async def runner() -> None:
         last_outcome: str | None = None
         try:
-            stream = harness.prompt(user_text) if user_text is not None else harness.continue_()
+            raw_stream = harness.prompt(user_text) if user_text is not None else harness.continue_()
+            # Reactive overflow-retry (design D3) is wired through
+            # ``AgentRuntime.run_turn``/``resume_ready`` normally; this layer
+            # drives its own harness directly instead (it needs to retain
+            # ``harness`` for ``harness.cancel()`` — see ``build_harness``'s
+            # docstring), so it opts into the same recovery explicitly here.
+            stream = state.runtime.drive_with_reactive_compaction(harness, session_id, raw_stream)
             async for event in stream:
                 await queue.put(_sse_agent_event(event))
                 if isinstance(event, AgentEndEvent):

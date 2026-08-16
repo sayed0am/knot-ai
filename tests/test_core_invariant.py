@@ -51,6 +51,21 @@ def test_content_difference_projects_unequal() -> None:
     assert canonical_history(history_a) != canonical_history(history_b)
 
 
+def test_error_type_only_difference_projects_equal() -> None:
+    """An error_type-only difference is diagnostic metadata (see
+    PROVIDER_INVISIBLE_FIELDS), not model-visible content, and must never be
+    reported as invariant divergence."""
+    error_a = AssistantMessage(stop_reason="error", error_message="boom", error_type="other")
+    error_b = AssistantMessage(
+        stop_reason="error", error_message="boom", error_type="context_overflow"
+    )
+
+    history_a = [UserMessage(content="hi"), error_a]
+    history_b = [UserMessage(content="hi"), error_b]
+
+    assert canonical_history(history_a) == canonical_history(history_b)
+
+
 def test_role_difference_projects_unequal() -> None:
     history_a = [UserMessage(content="hi")]
     history_b = [AssistantMessage(content="hi", stop_reason="stop")]

@@ -2,11 +2,20 @@
 
 # ruff: noqa: F401 - this module intentionally defines the public facade
 
+from knot.core.compaction import (
+    CompactionRejected,
+    CompactionSettings,
+    context_pressure,
+    select_boundary,
+    summarize,
+    validate_shrink,
+)
 from knot.core.decisions import Allow, Deny, RequireApproval, ToolDecision, ToolDecisionHook
 from knot.core.events import (
     AgentEndEvent,
     AgentEvent,
     AgentStartEvent,
+    CompactionEvent,
     MessageEndEvent,
     MessageStartEvent,
     MessageUpdateEvent,

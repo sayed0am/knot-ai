@@ -14,13 +14,16 @@ types), ``persistence`` (the harness subscriber that writes them),
 # ruff: noqa: F401 - this module intentionally defines the public facade
 
 from .entries import (
+    ENTRY_TYPE_COMPACTION,
     ENTRY_TYPE_EXECUTION_STARTED,
     ENTRY_TYPE_INPUT_REQUESTED,
     ENTRY_TYPE_INPUT_RESOLVED,
     ENTRY_TYPE_MESSAGE,
+    Compaction,
     ExecutionStarted,
     InputResolution,
     ResolutionDecision,
+    entry_to_compaction,
     entry_to_execution_started,
     entry_to_message,
     entry_to_request,

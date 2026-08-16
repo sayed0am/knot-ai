@@ -49,6 +49,7 @@ model:
   provider: anthropic
   name: claude-3-5-haiku-20241022
   max_tokens: 1024
+  context_window: 200000
 limits:
   max_turns: 12
   max_result_bytes: null
@@ -58,6 +59,12 @@ use:
   - crm
 approvals:
   update_customer: always
+compaction:
+  enabled: true
+  threshold_ratio: 0.8
+  retain_budget: 0.16
+  summarization_model: null
+  max_overflow_retries: 1
 ```
 
 | Field | Type | Default | Meaning |
@@ -66,12 +73,14 @@ approvals:
 | `model.provider` | `"anthropic" \| "openai" \| "openrouter" \| "litellm"` | — (required if `model:` is present) | Which provider family this agent's model belongs to. In v0, `knot serve` talks to every session through one shared provider instance regardless of this field — it is informational/forward-looking, not yet a per-agent provider switch. |
 | `model.name` | `str` | — (required if `model:` is present) | The model name/id passed to the provider. |
 | `model.max_tokens` | `int \| null` | `null` | Passed through to the provider on every call. |
+| `model.context_window` | `int \| null` | `null` | The model's context window, in tokens — see [Context compaction](#context-compaction) below. Must be a positive integer if set. `null` doesn't disable compaction outright: knot falls back to a small built-in table of well-known model names (`knot.providers.capacity`); only an unmapped model name with no explicit override leaves capacity — and therefore the *proactive* trigger — unknown. |
 | `limits.max_turns` | `int \| null` | `null` (unlimited) | Maximum number of assistant turns before the run stops. |
 | `limits.max_result_bytes` | `int \| null` | `null` | Caps a tool result's serialized size; an oversized result is spilled — replaced with a bounded preview plus a retrieval notice — with truncation as the fallback. See [Oversized tool results (spill)](#oversized-tool-results-spill) below. |
 | `limits.delegation_max_per_turn` | `int` | `4` | How many delegation (subagent) calls this agent may make in a single turn; exceeding it fails the delegation call with an error instead of running it. |
 | `limits.delegation_max_concurrent` | `int` | `2` | How many delegation calls may be in flight at once, enforced by a semaphore. |
 | `use` | `list[str]` | `[]` | Bundle ids (directory names under `shared/`) whose tools, skills, and approvals this agent pulls in. See [`docs/bundles.md`](bundles.md). |
 | `approvals` | `dict[str, "never"\|"once"\|"always"]` | `{}` | Per-tool approval policy overrides. **Agent-level approvals always win over a bundle's** — see [`docs/bundles.md`](bundles.md) for the full vocabulary and suffix-matching rule. |
+| `compaction.*` | — | enabled, defaults below | Context compaction settings — see [Context compaction](#context-compaction) below for the full field list and validation rules. |
 
 If `model:` is omitted entirely, the session runs with the runtime's
 `default_model` (a fallback the server operator configures, not part of
@@ -203,6 +212,117 @@ own `@tool` as exempt from spilling. `spill_exempt` exists as an internal
 `AgentTool` field (set on `read_tool_output` itself, to prevent the
 spill-retrieve loop above), but it is not a parameter the `@tool` decorator
 accepts — an authored tool's results are always eligible for spilling.
+
+## Context compaction
+
+A session that lives long enough will eventually accumulate more history
+than its model's context window can hold. knot handles this by durably
+replacing the oldest span of a session's conversation with a single
+model-generated summary message, rather than letting every subsequent run
+hard-fail with a provider error. It is on by default — an agent with no
+`compaction:` block still gets it, under the defaults below.
+
+```yaml
+compaction:
+  enabled: true
+  threshold_ratio: 0.8
+  retain_budget: 0.16
+  summarization_model: null
+  max_overflow_retries: 1
+```
+
+| Field | Type | Default | Meaning |
+|---|---|---|---|
+| `enabled` | `bool` | `true` | Turns compaction off entirely for this agent (both the proactive and reactive paths) when `false`. |
+| `threshold_ratio` | `float`, `(0, 1]` | `0.8` | Proactive trigger: compact when the most recent provider-reported context usage (`input + cacheRead + cacheWrite` of the latest assistant response) is at or above `threshold_ratio × model.context_window`. |
+| `retain_budget` | `float`, `(0, 1)` | `0.16` | The fraction of `model.context_window` to keep as a verbatim tail when compacting — an estimated budget (see below), not an exact count. **Must be strictly less than `threshold_ratio`** — otherwise the retained tail alone could already exceed the trigger threshold, immediately re-triggering compaction on the very next turn. Compile fails if it isn't. |
+| `summarization_model` | `str \| null` | `null` | Override the model used for the summarization call itself. `null` (the default) reuses the session's own model. |
+| `max_overflow_retries` | `int`, `>= 0` | `1` | How many times the reactive path (below) will compact-and-retry a single context-overflow failure before giving up and surfacing the original error. |
+| `summarization_max_tokens` | `int`, `> 0` | `8192` | Accepted for forward compatibility with a future per-call token-limit parameter on the provider layer; not yet enforced (every provider adapter bakes its ceiling in at construction time today). |
+
+Invalid values fail fleet compilation with a diagnostic naming the
+offending field (`knot validate` reports it like any other compile error)
+— an out-of-range `threshold_ratio`, a non-numeric `max_overflow_retries`,
+or `retain_budget >= threshold_ratio`.
+
+### When compaction runs
+
+Two independent triggers, both governed by the same config block:
+
+- **Proactive** — checked between turns, before the next provider request:
+  if the latest assistant response's reported context usage crossed
+  `threshold_ratio × model.context_window`, compaction runs first, and that
+  next request is built from the compacted history instead. Needs
+  `model.context_window` (explicit or resolved from the built-in defaults
+  table) to be known; if it isn't, the proactive trigger is simply
+  disabled for that agent — the reactive path still protects the session.
+- **Reactive** — a provider request that fails with a context-overflow
+  error (classified from the provider's own error shape, not guessed from
+  text) is compacted-and-retried automatically instead of surfacing the
+  error, up to `max_overflow_retries` times. See `docs/http-api.md`'s
+  [Context compaction](http-api.md#context-compaction) section for exactly
+  what a client sees on the event stream when this happens.
+
+A compaction that would not actually shrink the history — the generated
+summary plus the retained tail turns out at least as large as the span it
+replaces — is rejected outright: the conversation surface is left
+untouched, and (on the reactive path) the original provider error is what
+surfaces. A summarization call that itself errors, or returns an empty or
+tool-call-containing response, is rejected the same way. Either way,
+nothing is ever silently lost — see [The entry log keeps everything](#the-entry-log-keeps-everything)
+below.
+
+### What the model sees
+
+Compaction replaces the oldest contiguous span of messages with one
+summary message, and always keeps a recent tail verbatim — sized by
+`retain_budget`, estimated conservatively from each message's own length
+(a cheap `len(text) // 4` proxy, or the provider's own reported output-
+token count where one is available), never an exact token count. That
+estimate only ever decides *where* to cut; whether the result was actually
+small enough is settled by the next request's real, provider-reported
+usage.
+
+The boundary itself never splits an assistant message from the tool
+results answering it, and never lands after the most recent user turn, so
+a compaction can't cut a conversation off mid-exchange.
+
+The summary itself enters the model's context as an ordinary message — a
+`user`-role turn whose text is wrapped in `<compacted-summary>...
+</compacted-summary>` tags, so the model can tell it is reading a summary
+of earlier conversation rather than something the human user actually
+typed:
+
+```
+<compacted-summary>
+The user asked about order ORD-1001; it shipped via UPS and is expected to
+arrive 2026-08-16. No further action was requested.
+</compacted-summary>
+```
+
+The summarization call that produces this text replays the session's own
+system prompt, tool schemas, and the exact messages being compacted (plus
+any prior summary, if this isn't the session's first compaction), with the
+summarize instruction appended as one final message — matching the shape
+of a real request lets the provider serve it from its own warm prefix
+cache, so compacting doesn't mean paying to re-ingest the whole history a
+second time.
+
+### The entry log keeps everything
+
+Compaction is an append-only projection change, not a rewrite. The
+underlying `"message"` entries a compaction replaces are never deleted or
+modified in the session's durable entry log — only the *provider-visible*
+history (what the model actually sees on the next request) changes. A
+durable `"compaction"` entry records which span was covered and the
+summary that replaced it; reading a session's raw entries (an export, a
+fleet query, or just `SessionStore.entries`) after compaction still shows
+every original message, in full, exactly as it was written, alongside that
+one compaction entry — a complete audit trail survives regardless of how
+much of the model-visible history has been summarized away. Rehydrating a
+compacted session after a restart derives exactly the same post-compaction
+history the live session had — same durability guarantee as every other
+fact knot records.
 
 ## Subagents
 

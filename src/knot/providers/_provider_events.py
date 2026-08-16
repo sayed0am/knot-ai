@@ -15,7 +15,7 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict
 
-from knot.providers.messages import AssistantMessage, ToolCall
+from knot.providers.messages import AssistantMessage, ErrorType, ToolCall
 from knot.providers.types import JSONValue
 
 
@@ -80,7 +80,14 @@ class ProviderResponseEndEvent(BaseModel):
 
 
 class ProviderErrorEvent(BaseModel):
-    """A provider-level error that can be surfaced by the agent layer."""
+    """A provider-level error that can be surfaced by the agent layer.
+
+    ``error_type`` defaults to ``"other"`` (never ``None``) because every
+    adapter site that constructs this event is, by definition, reporting a
+    real error; an adapter that hasn't bothered classifying the native
+    error shape still reports something meaningful rather than silently
+    looking like an unclassified/non-error message downstream.
+    """
 
     model_config = ConfigDict(extra="forbid")
 
@@ -88,6 +95,7 @@ class ProviderErrorEvent(BaseModel):
     message: str
     data: dict[str, JSONValue] | None = None
     response_provider: str | None = None
+    error_type: ErrorType = "other"
 
 
 class ProviderAbortedEvent(BaseModel):

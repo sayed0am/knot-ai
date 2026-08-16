@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Literal
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 
 from knot.authoring.discovery import Diagnostic
 from knot.providers.messages import WireModel
@@ -43,6 +43,73 @@ class ModelConfig(WireModel):
     provider: Literal["anthropic", "openai", "openrouter", "litellm"]
     name: str
     max_tokens: int | None = None
+    # Overrides `knot.providers.capacity`'s built-in defaults table for this
+    # model's context window (used by the proactive compaction trigger).
+    # `None` (the default) falls back to the table; an unmapped model with
+    # no override just leaves proactive compaction disabled for that model.
+    context_window: int | None = None
+
+    @field_validator("context_window")
+    @classmethod
+    def _context_window_must_be_positive(cls, value: int | None) -> int | None:
+        if value is not None and value <= 0:
+            raise ValueError("model.context_window must be a positive integer")
+        return value
+
+
+class CompactionConfig(WireModel):
+    """Embedded verbatim into ``AgentManifest.compaction``; see
+    ``ModelConfig`` for why this is a ``WireModel``.
+
+    Defaults enable compaction with no configuration at all (spec: "Zero-
+    config default"). ``retain_budget`` must stay strictly below
+    ``threshold_ratio`` — otherwise a proactive compaction would retain a
+    tail that alone already exceeds the trigger threshold, immediately
+    re-triggering next turn.
+    """
+
+    enabled: bool = True
+    threshold_ratio: float = 0.8
+    retain_budget: float = 0.16
+    summarization_model: str | None = None
+    max_overflow_retries: int = 1
+    summarization_max_tokens: int = 8192
+
+    @field_validator("threshold_ratio")
+    @classmethod
+    def _threshold_ratio_range(cls, value: float) -> float:
+        if not (0 < value <= 1):
+            raise ValueError("compaction.threshold_ratio must be within (0, 1]")
+        return value
+
+    @field_validator("retain_budget")
+    @classmethod
+    def _retain_budget_range(cls, value: float) -> float:
+        if not (0 < value < 1):
+            raise ValueError("compaction.retain_budget must be within (0, 1)")
+        return value
+
+    @field_validator("max_overflow_retries")
+    @classmethod
+    def _max_overflow_retries_non_negative(cls, value: int) -> int:
+        if value < 0:
+            raise ValueError("compaction.max_overflow_retries must be >= 0")
+        return value
+
+    @field_validator("summarization_max_tokens")
+    @classmethod
+    def _summarization_max_tokens_positive(cls, value: int) -> int:
+        if value <= 0:
+            raise ValueError("compaction.summarization_max_tokens must be a positive integer")
+        return value
+
+    @model_validator(mode="after")
+    def _retain_budget_below_threshold(self) -> CompactionConfig:
+        if self.retain_budget >= self.threshold_ratio:
+            raise ValueError(
+                "compaction.retain_budget must be less than compaction.threshold_ratio"
+            )
+        return self
 
 
 class LimitsConfig(WireModel):
@@ -62,6 +129,7 @@ class AgentConfig(_StrictModel):
     description: str | None = None
     model: ModelConfig | None = None
     limits: LimitsConfig = Field(default_factory=LimitsConfig)
+    compaction: CompactionConfig = Field(default_factory=CompactionConfig)
     use: list[str] = Field(default_factory=list)
     approvals: dict[str, ApprovalPolicyName] = Field(default_factory=dict)
 
@@ -185,6 +253,7 @@ __all__ = [
     "AgentConfig",
     "ApprovalPolicyName",
     "BundleConfig",
+    "CompactionConfig",
     "ConnectionConfig",
     "LimitsConfig",
     "ModelConfig",

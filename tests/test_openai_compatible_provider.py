@@ -189,6 +189,62 @@ async def test_non_transient_http_error_surfaces_without_retry() -> None:
     assert "invalid api key" in events[-1].error.error_message
 
 
+async def test_context_length_exceeded_code_is_classified() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            400,
+            json={
+                "error": {
+                    "message": "This model's maximum context length is 128000 tokens.",
+                    "code": "context_length_exceeded",
+                }
+            },
+        )
+
+    provider, client = _provider(handler, max_retries=0, max_retry_delay_seconds=0)
+    async with client:
+        events = await _collect(
+            provider.stream_response(
+                model="gpt-test", system="s", messages=[UserMessage(content="hi")], tools=[]
+            )
+        )
+
+    assert isinstance(events[-1], AssistantErrorEvent)
+    assert events[-1].error.error_type == "context_overflow"
+
+
+async def test_openai_429_is_classified_as_rate_limit() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(429, json={"error": {"message": "rate limited"}})
+
+    provider, client = _provider(handler, max_retries=0, max_retry_delay_seconds=0)
+    async with client:
+        events = await _collect(
+            provider.stream_response(
+                model="gpt-test", system="s", messages=[UserMessage(content="hi")], tools=[]
+            )
+        )
+
+    assert isinstance(events[-1], AssistantErrorEvent)
+    assert events[-1].error.error_type == "rate_limit"
+
+
+async def test_openai_unrelated_400_is_classified_as_other() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(400, json={"error": {"message": "bad request", "code": "bad"}})
+
+    provider, client = _provider(handler, max_retries=0, max_retry_delay_seconds=0)
+    async with client:
+        events = await _collect(
+            provider.stream_response(
+                model="gpt-test", system="s", messages=[UserMessage(content="hi")], tools=[]
+            )
+        )
+
+    assert isinstance(events[-1], AssistantErrorEvent)
+    assert events[-1].error.error_type == "other"
+
+
 async def test_transient_status_is_retried_then_succeeds() -> None:
     requests: list[httpx.Request] = []
 

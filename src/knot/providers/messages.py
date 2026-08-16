@@ -123,6 +123,14 @@ class AssistantMessageDiagnostic(WireModel):
 
 StopReason = Literal["stop", "length", "toolUse", "error", "aborted"]
 
+# Coarse, provider-neutral classification of an error `AssistantMessage`
+# (`stop_reason="error"`). Populated by provider adapters from their native
+# error shapes (see `knot.providers._http_errors.classify_provider_error_type`
+# and each adapter's classification call sites). Only `"context_overflow"`
+# authorizes reactive compaction; everything else is handled like today's
+# plain provider error.
+ErrorType = Literal["context_overflow", "rate_limit", "other"]
+
 
 class AssistantMessage(WireModel):
     """An assistant message with ordered content blocks."""
@@ -139,6 +147,12 @@ class AssistantMessage(WireModel):
     usage: Usage = Usage()
     stop_reason: StopReason = "stop"
     error_message: str | None = None
+    # `None` means "not an error message" (or a message built before
+    # classification runs) — never a deliberate classification. Every error
+    # AssistantMessage an adapter constructs (`stop_reason="error"`) must set
+    # this to one of the three literal values, using `"other"` when the
+    # native error shape doesn't match a known case. See `ErrorType`.
+    error_type: ErrorType | None = None
     timestamp: int = Field(default_factory=current_timestamp_ms)
 
     @model_validator(mode="before")

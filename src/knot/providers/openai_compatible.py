@@ -18,7 +18,7 @@ from typing import Any
 import httpx
 
 from knot.providers._http import create_async_client
-from knot.providers._http_errors import provider_http_error_message
+from knot.providers._http_errors import classify_provider_error_type, provider_http_error_message
 from knot.providers._provider_events import (
     ProviderAbortedEvent,
     ProviderErrorEvent,
@@ -78,9 +78,7 @@ class OpenAICompatibleProvider:
         provider_name: str = "OpenAI-compatible provider",
         client: httpx.AsyncClient | None = None,
     ) -> None:
-        resolved_api_key = api_key or (
-            os.environ.get(api_key_env_var) if api_key_env_var else None
-        )
+        resolved_api_key = api_key or (os.environ.get(api_key_env_var) if api_key_env_var else None)
         if not resolved_api_key:
             hint = f" or set {api_key_env_var}" if api_key_env_var else ""
             raise RuntimeError(f"API key is required: pass api_key={hint}")
@@ -193,6 +191,9 @@ class OpenAICompatibleProvider:
                                     "body": body_text,
                                     "attempts": attempt + 1,
                                 },
+                                error_type=classify_provider_error_type(
+                                    status_code=response.status_code, body=body_text
+                                ),
                             )
                             return
 

@@ -16,6 +16,17 @@ so it round-trips through the same JSON the transport layer already uses):
   eventual tool-result ``message`` entry. Its sole purpose is crash-window
   detection: an ``execution_started`` with no matching tool-result means the
   process died mid-execution (see ``knot.core.hitl.resume.detect_crash_windows``).
+- ``"compaction"``: one ``Compaction`` — durably records that the oldest
+  span of a session's history (every message entry with ``seq <=
+  covers_through_seq``) has been replaced, in the provider-visible
+  projection only, by ``summary_message``. The underlying message entries
+  are never deleted or rewritten (see the append-only audit-trail
+  requirement in ``openspec/changes/add-context-compaction``); this entry
+  only changes what ``knot.core.session.state.derive_state`` folds them
+  into. ``summary_message`` is a full ``AgentMessage`` (not a plain string)
+  so every downstream surface that already knows how to handle a message —
+  rehydration, export, the model-visible-logged invariant — handles it with
+  zero new cases.
 """
 
 from __future__ import annotations
@@ -33,6 +44,7 @@ ENTRY_TYPE_MESSAGE: Literal["message"] = "message"
 ENTRY_TYPE_INPUT_REQUESTED: Literal["input_requested"] = "input_requested"
 ENTRY_TYPE_INPUT_RESOLVED: Literal["input_resolved"] = "input_resolved"
 ENTRY_TYPE_EXECUTION_STARTED: Literal["execution_started"] = "execution_started"
+ENTRY_TYPE_COMPACTION: Literal["compaction"] = "compaction"
 
 ResolutionDecision = Literal["approved", "denied"]
 
@@ -61,6 +73,22 @@ class ExecutionStarted(WireModel):
     started_at: int = Field(default_factory=current_timestamp_ms)
 
 
+class Compaction(WireModel):
+    """Durable record of one compaction: the span it covers and its summary.
+
+    ``covers_through_seq`` is the highest entry ``seq`` of a ``"message"``
+    entry replaced by this compaction — inclusive, and compared against the
+    store's own stable, monotonic ``Entry.seq`` (not a message index, which
+    shifts as later compactions land). ``summary_message`` is the complete
+    ``AgentMessage`` that takes the covered span's place at the front of the
+    provider-visible history (see ``knot.core.session.state.derive_state``).
+    """
+
+    covers_through_seq: int
+    summary_message: AgentMessage
+    created_at: int = Field(default_factory=current_timestamp_ms)
+
+
 _agent_message_adapter: TypeAdapter[AgentMessage] = TypeAdapter(AgentMessage)
 
 
@@ -84,14 +112,22 @@ def entry_to_execution_started(entry: Entry) -> ExecutionStarted:
     return ExecutionStarted.model_validate(entry.payload)
 
 
+def entry_to_compaction(entry: Entry) -> Compaction:
+    """Deserialize a ``"compaction"`` entry's payload."""
+    return Compaction.model_validate(entry.payload)
+
+
 __all__ = [
+    "ENTRY_TYPE_COMPACTION",
     "ENTRY_TYPE_EXECUTION_STARTED",
     "ENTRY_TYPE_INPUT_REQUESTED",
     "ENTRY_TYPE_INPUT_RESOLVED",
     "ENTRY_TYPE_MESSAGE",
+    "Compaction",
     "ExecutionStarted",
     "InputResolution",
     "ResolutionDecision",
+    "entry_to_compaction",
     "entry_to_execution_started",
     "entry_to_message",
     "entry_to_request",

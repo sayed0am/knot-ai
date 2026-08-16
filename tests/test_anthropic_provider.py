@@ -216,6 +216,64 @@ async def test_transient_status_is_retried_then_succeeds() -> None:
     assert events[-1].message.text == "ok"
 
 
+async def test_context_overflow_400_is_classified() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            400,
+            json={
+                "error": {
+                    "type": "invalid_request_error",
+                    "message": "prompt is too long: 250000 tokens > 200000 maximum",
+                }
+            },
+        )
+
+    provider, client = _provider(handler, max_retries=2, max_retry_delay_seconds=0)
+    async with client:
+        events = await _collect(
+            provider.stream_response(
+                model="claude-test", system="s", messages=[UserMessage(content="hi")], tools=[]
+            )
+        )
+
+    assert isinstance(events[-1], AssistantErrorEvent)
+    assert events[-1].error.error_type == "context_overflow"
+
+
+async def test_429_is_classified_as_rate_limit() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(429, json={"error": {"message": "rate limited"}})
+
+    provider, client = _provider(handler, max_retries=0, max_retry_delay_seconds=0)
+    async with client:
+        events = await _collect(
+            provider.stream_response(
+                model="claude-test", system="s", messages=[UserMessage(content="hi")], tools=[]
+            )
+        )
+
+    assert isinstance(events[-1], AssistantErrorEvent)
+    assert events[-1].error.error_type == "rate_limit"
+
+
+async def test_unrelated_400_is_classified_as_other() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            400, json={"error": {"type": "invalid_request_error", "message": "bad request"}}
+        )
+
+    provider, client = _provider(handler, max_retries=0, max_retry_delay_seconds=0)
+    async with client:
+        events = await _collect(
+            provider.stream_response(
+                model="claude-test", system="s", messages=[UserMessage(content="hi")], tools=[]
+            )
+        )
+
+    assert isinstance(events[-1], AssistantErrorEvent)
+    assert events[-1].error.error_type == "other"
+
+
 async def test_permanent_error_does_not_retry_storm() -> None:
     """A non-transient status must fail after exactly one attempt."""
     requests: list[httpx.Request] = []
