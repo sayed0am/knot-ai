@@ -185,9 +185,7 @@ def child_chain(store: SessionStore, session_id: str) -> list[ChildChainRow]:
     SELECT * FROM descendants WHERE depth > 0 ORDER BY depth ASC, created_at ASC, session_id ASC
     """
     rows = store.query(sql, (session_id,))
-    return [
-        ChildChainRow(session=session_from_row(row), depth=row["depth"]) for row in rows
-    ]
+    return [ChildChainRow(session=session_from_row(row), depth=row["depth"]) for row in rows]
 
 
 def scan_payloads(store: SessionStore, needle: str) -> list[tuple[str, int, str]]:

@@ -98,9 +98,9 @@ def test_pending_requests_fleet_kinds_filter_excludes_child_session_rows() -> No
         # something a human ever acts on) plus the child's own real approval
         # request (what an approvals inbox should actually show).
         store.append_entry(
-            root.session_id, "input_requested", _child_session_request("req_link").model_dump(
-                by_alias=True
-            )
+            root.session_id,
+            "input_requested",
+            _child_session_request("req_link").model_dump(by_alias=True),
         )
         store.append_entry(
             child.session_id, "input_requested", _request("req_approval").model_dump(by_alias=True)

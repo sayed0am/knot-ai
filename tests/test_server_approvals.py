@@ -46,9 +46,7 @@ async def test_approvals_empty_when_nothing_pending(tmp_path: Path) -> None:
 
 async def test_approvals_lists_a_question_park_too(tmp_path: Path) -> None:
     write_files(tmp_path, {"agents/root/instructions.md": "you are root\n"})
-    app = make_app(
-        tmp_path, [tool_call("ask_user", {"question": "which account?"})]
-    )
+    app = make_app(tmp_path, [tool_call("ask_user", {"question": "which account?"})])
     async with client_for(app) as client:
         created = await client.post("/agents/root/sessions")
         session_id = created.json()["sessionId"]
@@ -110,9 +108,7 @@ async def test_approvals_never_lists_a_child_session_park(tmp_path: Path) -> Non
 
 async def test_approvals_resolves_and_disappears_from_the_inbox(tmp_path: Path) -> None:
     _gated_fleet(tmp_path)
-    app = make_app(
-        tmp_path, [tool_call("sensitive_op", {"amount": 1}), reply("done")]
-    )
+    app = make_app(tmp_path, [tool_call("sensitive_op", {"amount": 1}), reply("done")])
     async with client_for(app) as client:
         created = await client.post("/agents/root/sessions")
         session_id = created.json()["sessionId"]

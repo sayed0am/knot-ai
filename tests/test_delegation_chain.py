@@ -32,9 +32,7 @@ def _write_fleet(tmp_path: Path) -> None:
             "agents/root/instructions.md": "you are the root agent\n",
             "agents/root/subagents/researcher/instructions.md": "you are the researcher\n",
             "agents/root/subagents/researcher/agent.yaml": (
-                "description: Digs up facts.\n"
-                "approvals:\n"
-                "  dangerous_lookup: always\n"
+                "description: Digs up facts.\napprovals:\n  dangerous_lookup: always\n"
             ),
             "agents/root/subagents/researcher/tools/dangerous_lookup.py": (
                 "from knot.authoring.tools import tool\n\n\n"

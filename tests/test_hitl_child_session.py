@@ -35,9 +35,7 @@ async def test_resolve_inputs_rejects_any_response_to_a_child_session_request() 
     with SessionStore(":memory:") as store:
         session = store.create_session("agent_root")
         request = _child_session_request()
-        store.append_entry(
-            session.session_id, "input_requested", request.model_dump(by_alias=True)
-        )
+        store.append_entry(session.session_id, "input_requested", request.model_dump(by_alias=True))
 
         outcome = await resolve_inputs(
             store,
@@ -67,9 +65,7 @@ async def test_write_child_completion_writes_two_ordered_records() -> None:
     with SessionStore(":memory:") as store:
         session = store.create_session("agent_root")
         request = _child_session_request()
-        store.append_entry(
-            session.session_id, "input_requested", request.model_dump(by_alias=True)
-        )
+        store.append_entry(session.session_id, "input_requested", request.model_dump(by_alias=True))
 
         result_message = ToolResultMessage(
             tool_call_id=request.tool_call_id, tool_name=request.tool_name, content="the answer"

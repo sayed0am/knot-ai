@@ -116,9 +116,7 @@ def find_tool_marker(module: ModuleType) -> ToolMarker:
         raise ToolDefinitionError("module defines no @tool-decorated function")
     if len(markers) > 1:
         names = ", ".join(sorted(m.func.__name__ for m in markers))
-        raise ToolDefinitionError(
-            f"module defines more than one @tool-decorated function: {names}"
-        )
+        raise ToolDefinitionError(f"module defines more than one @tool-decorated function: {names}")
     return markers[0]
 
 

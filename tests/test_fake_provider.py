@@ -90,15 +90,9 @@ async def test_aborted_error_reason_is_configurable() -> None:
 async def test_provider_replays_scripts_in_order_and_empty_after_exhaustion() -> None:
     provider = FakeProvider([reply("one"), reply("two")])
 
-    first = await _collect(
-        provider.stream_response(model="m", system="s", messages=[], tools=[])
-    )
-    second = await _collect(
-        provider.stream_response(model="m", system="s", messages=[], tools=[])
-    )
-    third = await _collect(
-        provider.stream_response(model="m", system="s", messages=[], tools=[])
-    )
+    first = await _collect(provider.stream_response(model="m", system="s", messages=[], tools=[]))
+    second = await _collect(provider.stream_response(model="m", system="s", messages=[], tools=[]))
+    third = await _collect(provider.stream_response(model="m", system="s", messages=[], tools=[]))
 
     assert first[-1].message.text == "one"
     assert second[-1].message.text == "two"
@@ -112,9 +106,7 @@ async def test_provider_stops_replay_when_cancelled() -> None:
     signal.cancel()
 
     events = await _collect(
-        provider.stream_response(
-            model="m", system="s", messages=[], tools=[], signal=signal
-        )
+        provider.stream_response(model="m", system="s", messages=[], tools=[], signal=signal)
     )
 
     assert events == []

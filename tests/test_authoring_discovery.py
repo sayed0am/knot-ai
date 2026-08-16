@@ -123,9 +123,7 @@ def test_skills_subdir_without_skill_md_is_a_warning(tmp_path: Path) -> None:
     discovery = discover_agent(tmp_path / "agents" / "helper")
 
     assert discovery.skills == ()
-    assert any(
-        d.severity == "warning" and "incomplete" in d.message for d in discovery.diagnostics
-    )
+    assert any(d.severity == "warning" and "incomplete" in d.message for d in discovery.diagnostics)
 
 
 def test_skill_with_invalid_id_is_an_error(tmp_path: Path) -> None:

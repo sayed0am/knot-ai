@@ -39,9 +39,7 @@ async def test_persistence_writes_exactly_the_message_entries_a_run_produces() -
         events = [event async for event in harness.prompt("hi")]
         subscriber.release()
 
-        expected_messages = [
-            e.message for e in events if isinstance(e, MessageEndEvent)
-        ]
+        expected_messages = [e.message for e in events if isinstance(e, MessageEndEvent)]
 
         entries = store.entries(session.session_id)
         assert [e.type for e in entries] == [ENTRY_TYPE_MESSAGE] * len(expected_messages)

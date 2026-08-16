@@ -250,9 +250,7 @@ async def test_post_message_while_running_is_409(tmp_path: Path) -> None:
                 if "tool_execution_start" in buf:
                     break
 
-            conflict = await client.post(
-                f"/sessions/{session_id}/messages", json={"text": "again"}
-            )
+            conflict = await client.post(f"/sessions/{session_id}/messages", json={"text": "again"})
             assert conflict.status_code == 409
 
         for _ in range(50):

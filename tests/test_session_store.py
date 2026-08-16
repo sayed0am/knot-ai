@@ -77,9 +77,7 @@ def test_append_and_read_round_trip_for_all_entry_types() -> None:
         requested_entry = store.append_entry(
             session.session_id, "input_requested", requested_payload
         )
-        resolved_entry = store.append_entry(
-            session.session_id, "input_resolved", resolved_payload
-        )
+        resolved_entry = store.append_entry(session.session_id, "input_resolved", resolved_payload)
 
         assert message_entry.seq == 0
         assert requested_entry.seq == 1

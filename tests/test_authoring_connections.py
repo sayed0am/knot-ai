@@ -160,9 +160,7 @@ async def test_health_check_reports_drift_without_writing(tmp_path: Path) -> Non
                 {
                     "connection": "api",
                     "capturedAt": "x",
-                    "tools": [
-                        {"name": "only_this", "description": "d", "inputSchema": {}}
-                    ],
+                    "tools": [{"name": "only_this", "description": "d", "inputSchema": {}}],
                 }
             ),
             encoding="utf-8",
@@ -184,7 +182,10 @@ def test_format_refresh_report_is_stable_text() -> None:
     report = RefreshReport(
         results=(
             ConnectionRefreshResult(
-                bundle_id="svc", connection="api", status="ok", added=("new_tool",),
+                bundle_id="svc",
+                connection="api",
+                status="ok",
+                added=("new_tool",),
                 affected_agents=("helper",),
             ),
             ConnectionRefreshResult(

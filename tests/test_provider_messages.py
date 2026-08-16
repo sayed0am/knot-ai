@@ -140,8 +140,7 @@ def test_assistant_content_builds_ordered_blocks() -> None:
 def test_content_text_handles_string_and_blocks() -> None:
     assert content_text("plain") == "plain"
     assert (
-        content_text([TextContent(text="a"), ImageContent(data="x", mime_type="image/png")])
-        == "a"
+        content_text([TextContent(text="a"), ImageContent(data="x", mime_type="image/png")]) == "a"
     )
 
 

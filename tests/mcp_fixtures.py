@@ -64,9 +64,7 @@ class _FailNRequestsMiddleware(BaseHTTPMiddleware):
     forever (the "credentials are just bad" scenario).
     """
 
-    def __init__(
-        self, app, *, fail_on_call_number: int = 1, always_fail: bool = False
-    ) -> None:
+    def __init__(self, app, *, fail_on_call_number: int = 1, always_fail: bool = False) -> None:
         super().__init__(app)
         self._fail_on_call_number = fail_on_call_number
         self._always_fail = always_fail
