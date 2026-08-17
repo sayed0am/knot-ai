@@ -111,6 +111,68 @@ def test_select_boundary_rejects_when_widening_leaves_fewer_than_two_compacted()
     assert boundary is None
 
 
+def test_select_boundary_is_seq_closed_after_prior_compaction() -> None:
+    # After a compaction, derive_state tracks the summary at list position 0
+    # under the compaction entry's own (high) seq, ahead of retained
+    # messages with lower seqs — the seq view is non-monotonic. The
+    # boundary must be upward-closed (the max seq of the compacted prefix),
+    # or the seq-filtered split would leave the prior summary in the
+    # retained tail.
+    summary = UserMessage(content="<compacted-summary>\nearlier\n</compacted-summary>")
+    old = [UserMessage(content="x" * 400) for _ in range(4)]
+    latest = UserMessage(content="latest turn")
+    pairs = [(10, summary), (6, old[0]), (7, old[1]), (8, old[2]), (9, old[3]), (11, latest)]
+
+    boundary = select_boundary(pairs, retain_tokens=150)
+    assert boundary == 10  # the prior summary's seq, not a stale tail seq (8)
+
+    # The seq-filtered compacted span (exactly how the runtime and
+    # derive_state apply the boundary) is a contiguous positional prefix
+    # that includes the prior summary.
+    compacted = [message for seq, message in pairs if seq <= boundary]
+    assert compacted == [message for _, message in pairs[: len(compacted)]]
+    assert compacted[0] is summary
+
+
+def test_select_boundary_retains_recent_user_turn_after_prior_compaction() -> None:
+    summary = UserMessage(content="<compacted-summary>\nearlier\n</compacted-summary>")
+    old = [UserMessage(content="x" * 400) for _ in range(3)]
+    latest = UserMessage(content="latest turn")
+    trailing = AssistantMessage(content=[], stop_reason="stop")
+    pairs = [(10, summary), (6, old[0]), (7, old[1]), (8, old[2]), (11, latest), (12, trailing)]
+
+    # A tiny budget wants to retain only the trailing assistant message,
+    # but the latest user turn (seq 11, newer than the prior compaction)
+    # must stay on the retained side of the seq-closed boundary.
+    boundary = select_boundary(pairs, retain_tokens=1)
+    assert boundary == 10
+    assert boundary < 11
+
+
+def test_select_boundary_compacts_when_stale_user_turn_unretainable() -> None:
+    # When the most recent user message predates the prior compaction, its
+    # seq sits below the prior summary's, so every upward-closed boundary
+    # that compacts anything swallows it. Compaction must still proceed
+    # (summarizing the stale user turn) rather than return None, which
+    # would disable compaction for the session's lifetime.
+    summary = UserMessage(content="<compacted-summary>\nearlier\n</compacted-summary>")
+    old = [UserMessage(content="x" * 400) for _ in range(3)]
+    stale_user = UserMessage(content="stale latest user")
+    pairs = [
+        (10, summary),
+        (6, old[0]),
+        (7, old[1]),
+        (8, old[2]),
+        (9, stale_user),
+        (11, AssistantMessage(content=[], stop_reason="stop")),
+        (12, AssistantMessage(content=[], stop_reason="stop")),
+    ]
+
+    boundary = select_boundary(pairs, retain_tokens=60)
+    assert boundary == 10
+    assert 9 <= boundary  # the stale user turn lands in the compacted span
+
+
 # -- context_pressure -------------------------------------------------------
 
 

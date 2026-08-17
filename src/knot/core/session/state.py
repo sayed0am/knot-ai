@@ -32,6 +32,13 @@ necessarily >= the earlier compaction entry's own seq, folding it drops the
 prior summary right along with the rest of the span it now also covers —
 no special-casing needed to detect "this accumulated message is itself a
 prior summary".
+
+One consequence: after a compaction, ``DerivedState.message_seqs`` is
+non-monotonic — the summary's (high) seq precedes the retained tail's
+lower seqs. Any consumer splitting the history by seq must therefore use
+a seq-upward-closed boundary (``{seq <= boundary}`` selects a contiguous
+positional prefix only then), which is exactly what
+``knot.core.compaction.select_boundary`` guarantees it returns.
 """
 
 from __future__ import annotations

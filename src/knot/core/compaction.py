@@ -187,6 +187,16 @@ def select_boundary(pairs: Sequence[tuple[int, AgentMessage]], retain_tokens: fl
     estimated token budget the retained tail should stay under (typically
     ``retain_budget * context_window``, computed by the caller).
 
+    The returned boundary is **seq-upward-closed**: the compacted span is
+    exactly ``{message : seq <= boundary}``, matching how both
+    ``derive_state``'s compaction fold and the runtime's split apply it.
+    After a prior compaction the seqs in ``pairs`` are non-monotonic (the
+    prior summary sits at position 0 under its compaction entry's high seq,
+    ahead of retained messages with lower seqs), so the boundary is the
+    *max* seq of the compacted prefix, not the seq of its last element —
+    otherwise the prior summary would leak into the retained tail and stale
+    summaries would accumulate on every subsequent compaction.
+
     Algorithm: walk from the tail accumulating ``_estimate_message_tokens``
     until the budget would be exceeded (always retaining at least the very
     last message, whatever the budget, so a pathologically small budget
@@ -196,6 +206,20 @@ def select_boundary(pairs: Sequence[tuple[int, AgentMessage]], retain_tokens: fl
     (the spec's "latest user turn kept intact"); finally reject a boundary
     that would compact fewer than two messages — not enough to be worth a
     summarization round trip.
+
+    Two consequences of the upward closure, both accepted as the minimal
+    valid behavior:
+
+    - The retain budget is approximate right after a prior compaction:
+      retained messages whose seqs fall below the prior summary's seq are
+      pulled into the compacted span even when the budget walk kept them.
+    - The latest-user-turn guard is best-effort: when the most recent user
+      message *predates* the prior compaction, every nonempty prefix
+      contains the prior summary's higher seq, so no upward-closed boundary
+      can compact anything while retaining that user message. Compaction
+      proceeds (the stale user turn is summarized) rather than being
+      skipped, which would otherwise disable compaction for the session's
+      lifetime and defeat reactive overflow recovery.
     """
     total = len(pairs)
     if total < 2:
@@ -213,16 +237,30 @@ def select_boundary(pairs: Sequence[tuple[int, AgentMessage]], retain_tokens: fl
     units = _atomic_units(pairs)
     tail_start = _snap_to_unit_start(units, tail_start)
 
-    last_user_index = next(
-        (i for i in range(total - 1, -1, -1) if isinstance(pairs[i][1], UserMessage)), None
+    def closed_boundary(prefix_len: int) -> int:
+        return max(seq for seq, _ in pairs[:prefix_len])
+
+    last_user = next(
+        (
+            (i, pairs[i][0])
+            for i in range(total - 1, -1, -1)
+            if isinstance(pairs[i][1], UserMessage)
+        ),
+        None,
     )
-    if last_user_index is not None and tail_start > last_user_index:
-        tail_start = _snap_to_unit_start(units, last_user_index)
+    if last_user is not None and tail_start >= 1:
+        last_user_index, last_user_seq = last_user
+        if closed_boundary(tail_start) >= last_user_seq:
+            pulled = _snap_to_unit_start(units, last_user_index)
+            if pulled == 0 or closed_boundary(pulled) < last_user_seq:
+                tail_start = pulled
+            # else: guard unsatisfiable — a prior summary (tracked under a
+            # higher seq) sits in every nonempty prefix; compact anyway.
 
     if tail_start < 2:
         return None
 
-    return pairs[tail_start - 1][0]
+    return closed_boundary(tail_start)
 
 
 def validate_shrink(replaced: Sequence[AgentMessage], summary: AgentMessage) -> bool:

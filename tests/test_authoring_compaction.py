@@ -107,6 +107,67 @@ async def test_proactive_compaction_fires_at_threshold_and_stays_invariant_green
     store.close()
 
 
+async def test_second_proactive_compaction_composes(tmp_path: Path) -> None:
+    """Regression: a second compaction must fold the first summary into its
+    span, not leave it stranded in the retained tail.
+
+    ``derive_state`` tracks a summary under its compaction entry's (high)
+    seq while the retained tail keeps lower seqs, so ``select_boundary``
+    must return a seq-upward-closed boundary; a positional boundary lets
+    the first summary survive the seq filter and the history ends up as
+    ``[S2, S1, ...]`` — two summaries, chronologically inverted.
+    """
+    yaml = """
+        model:
+          provider: anthropic
+          name: some-model
+          context_window: 1000
+        compaction:
+          enabled: true
+          threshold_ratio: 0.5
+          retain_budget: 0.23
+    """
+    fleet = _fleet(tmp_path, yaml)
+    provider = FakeProvider(
+        [
+            reply(_LONG_B),  # turn 1: no usage, nothing to trigger yet
+            reply(_LONG_B, usage=Usage(input=600)),  # turn 2: crosses 0.5 * 1000
+            reply("<first summary>"),  # turn 3's pre-turn summarization
+            reply("ack three", usage=Usage(input=700)),  # turn 3: crosses again
+            reply("<second summary>"),  # turn 4's pre-turn summarization
+            reply("ack four"),  # turn 4's real request
+        ]
+    )
+    runtime, store = _runtime(fleet, provider)
+    session = runtime.create_session("root")
+
+    for text in (_LONG_A, _LONG_A, "three"):
+        events = [e async for e in runtime.run_turn(session.session_id, text)]
+        assert events[-1].outcome == "completed"
+
+    events4 = [e async for e in runtime.run_turn(session.session_id, "four")]
+    assert events4[-1].outcome == "completed"
+    assert events4[-1].messages[-1].text == "ack four"
+    assert sum(isinstance(e, CompactionEvent) for e in events4) == 1
+
+    entries = store.entries(session.session_id)
+    compaction_entries = [e for e in entries if e.type == ENTRY_TYPE_COMPACTION]
+    assert len(compaction_entries) == 2
+    first, second = compaction_entries
+    # The second boundary reaches at least the first compaction entry's own
+    # seq — the seq the first summary is tracked under — so folding the
+    # second entry drops that summary along with the rest of its span.
+    assert second.payload["coversThroughSeq"] >= first.seq
+
+    derived = derive_state(entries)
+    summaries = [m for m in derived.messages if m.text.startswith("<compacted-summary>")]
+    assert len(summaries) == 1
+    assert derived.messages[0] is summaries[0]
+    assert "<second summary>" in derived.messages[0].text
+
+    store.close()
+
+
 async def test_proactive_compaction_does_not_fire_below_threshold(tmp_path: Path) -> None:
     yaml = """
         model:
