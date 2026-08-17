@@ -11,3 +11,5 @@ venv/
 dist/
 build/
 *.egg
+agentic-designs/
+Agentic_Design_Patterns_Complete.pdf
