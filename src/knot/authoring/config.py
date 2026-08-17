@@ -32,6 +32,28 @@ class _StrictModel(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
+class ApprovalSetting(_StrictModel):
+    """Object form of one ``approvals`` map entry (design D7): names a
+    policy plus an optional TTL, in place of the bare policy-name string.
+
+    ``ttl_seconds`` becomes ``RequireApproval.ttl_seconds`` for that tool's
+    approval park (see ``knot.core.hitl.policies.build_decision_hook``), so
+    the existing lazy expiry sweep (``knot.core.hitl.resume``) denies the
+    request once the TTL elapses. ``None`` (the default) matches the bare
+    string form exactly: no expiry.
+    """
+
+    policy: ApprovalPolicyName
+    ttl_seconds: int | None = None
+
+    @field_validator("ttl_seconds")
+    @classmethod
+    def _ttl_seconds_positive(cls, value: int | None) -> int | None:
+        if value is not None and value <= 0:
+            raise ValueError("approvals ttl_seconds must be a positive integer")
+        return value
+
+
 class ModelConfig(WireModel):
     """Embedded verbatim into ``AgentManifest.model`` (see ``manifest.py``),
     so this is a ``WireModel`` rather than ``_StrictModel``: the manifest is
@@ -48,6 +70,11 @@ class ModelConfig(WireModel):
     # `None` (the default) falls back to the table; an unmapped model with
     # no override just leaves proactive compaction disabled for that model.
     context_window: int | None = None
+    # Extended-thinking token budget, threaded per-call to the provider
+    # (design D1). Only the "anthropic" provider can honor it today; setting
+    # it for any other provider is a compile diagnostic, not a silent no-op
+    # (see `knot.authoring.compile`).
+    thinking_budget_tokens: int | None = None
 
     @field_validator("context_window")
     @classmethod
@@ -161,6 +188,19 @@ class LimitsConfig(WireModel):
     max_result_bytes: int | None = None
     delegation_max_per_turn: int = 4
     delegation_max_concurrent: int = 2
+    # Session-wide token budget (design D6): the sum of provider-reported
+    # input/output/cache tokens across every run of the session, derived
+    # from the durable entry log so it survives restarts and compaction
+    # (see `knot.authoring.runtime._session_token_baseline`). `None` (the
+    # default) means no budget check occurs.
+    max_session_tokens: int | None = None
+
+    @field_validator("max_session_tokens")
+    @classmethod
+    def _max_session_tokens_positive(cls, value: int | None) -> int | None:
+        if value is not None and value <= 0:
+            raise ValueError("limits.max_session_tokens must be a positive integer")
+        return value
 
 
 class AgentConfig(_StrictModel):
@@ -173,7 +213,7 @@ class AgentConfig(_StrictModel):
     compaction: CompactionConfig = Field(default_factory=CompactionConfig)
     repeat_guard: RepeatGuardConfig = Field(default_factory=RepeatGuardConfig)
     use: list[str] = Field(default_factory=list)
-    approvals: dict[str, ApprovalPolicyName] = Field(default_factory=dict)
+    approvals: dict[str, ApprovalPolicyName | ApprovalSetting] = Field(default_factory=dict)
 
 
 class ConnectionConfig(_StrictModel):
@@ -223,7 +263,7 @@ class BundleConfig(_StrictModel):
     """Schema for ``bundle.yaml``."""
 
     description: str | None = None
-    approvals: dict[str, ApprovalPolicyName] = Field(default_factory=dict)
+    approvals: dict[str, ApprovalPolicyName | ApprovalSetting] = Field(default_factory=dict)
     connections: dict[str, ConnectionConfig] = Field(default_factory=dict)
 
 
@@ -294,6 +334,7 @@ def load_bundle_config(
 __all__ = [
     "AgentConfig",
     "ApprovalPolicyName",
+    "ApprovalSetting",
     "BundleConfig",
     "CompactionConfig",
     "ConnectionConfig",

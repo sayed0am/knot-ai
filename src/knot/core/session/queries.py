@@ -153,6 +153,19 @@ def sessions_for_agent(store: SessionStore, agent_id: str) -> list[SessionRecord
     return [session_from_row(row) for row in rows]
 
 
+def all_sessions(store: SessionStore) -> list[SessionRecord]:
+    """Every persisted session in the store, oldest-first.
+
+    Used by serve-time crash-window repair (design D8,
+    ``knot.authoring.runtime.AgentRuntime.repair_all_crash_windows``), which
+    must sweep every session — top-level and delegated child alike, since a
+    crash window can occur in either — rather than one agent's history.
+    """
+    sql = "SELECT * FROM sessions ORDER BY created_at ASC, session_id ASC"
+    rows = store.query(sql)
+    return [session_from_row(row) for row in rows]
+
+
 @dataclass(frozen=True, slots=True)
 class ChildChainRow:
     """One descendant of a session, with its distance from that session."""
@@ -203,6 +216,7 @@ __all__ = [
     "ChildChainRow",
     "PendingRequestRow",
     "SessionHop",
+    "all_sessions",
     "child_chain",
     "pending_requests_fleet",
     "scan_payloads",

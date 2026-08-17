@@ -176,7 +176,10 @@ class FakeProvider:
         tools: Sequence[object],
         signal: CancellationToken | None = None,
         session_id: str | None = None,
+        max_tokens: int | None = None,
+        thinking_budget_tokens: int | None = None,
     ) -> AsyncIterator[AssistantMessageEvent]:
+        del max_tokens, thinking_budget_tokens
         self.calls.append((model, system, list(messages), list(tools)))
         self.session_ids.append(session_id)
         script = self._scripts.pop(0) if self._scripts else []

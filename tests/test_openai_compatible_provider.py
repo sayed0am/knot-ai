@@ -329,3 +329,58 @@ def test_reasoning_effort_none_is_sent_verbatim_and_unset_is_omitted() -> None:
         reasoning_effort=None,
     )
     assert "reasoning_effort" not in unset
+
+
+async def test_per_call_max_tokens_reaches_the_request_payload() -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(
+            200, text="data: [DONE]\n\n", headers={"content-type": "text/event-stream"}
+        )
+
+    provider, client = _provider(handler)
+    async with client:
+        await _collect(
+            provider.stream_response(
+                model="gpt-test",
+                system="s",
+                messages=[UserMessage(content="hi")],
+                tools=[],
+                max_tokens=777,
+            )
+        )
+
+    payload = loads(requests[0].content)
+    assert payload["max_completion_tokens"] == 777
+
+
+async def test_per_call_thinking_budget_is_accepted_and_ignored() -> None:
+    """No chat-completions equivalent exists; the request must go through
+    unaffected — the compile-time diagnostic is what stops this from being
+    set for this provider in the first place."""
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(
+            200, text="data: [DONE]\n\n", headers={"content-type": "text/event-stream"}
+        )
+
+    provider, client = _provider(handler)
+    async with client:
+        events = await _collect(
+            provider.stream_response(
+                model="gpt-test",
+                system="s",
+                messages=[UserMessage(content="hi")],
+                tools=[],
+                thinking_budget_tokens=4096,
+            )
+        )
+
+    assert isinstance(events[-1], AssistantDoneEvent)
+    payload = loads(requests[0].content)
+    assert "thinking" not in payload
+    assert "thinking_budget_tokens" not in payload

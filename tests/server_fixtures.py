@@ -54,6 +54,41 @@ def make_app(
     )
 
 
+@asynccontextmanager
+async def running_lifespan(app: FastAPI) -> AsyncIterator[None]:
+    """Drive ``app``'s ASGI lifespan startup/shutdown handshake for the
+    duration of the block.
+
+    Neither ``client_for`` (``httpx.ASGITransport`` never sends lifespan
+    events on its own — see ``tests/mcp_fixtures.py``) nor ``live_server``
+    (built with ``lifespan="off"``) runs it, so a test exercising
+    ``create_app``'s startup crash-window repair (design D8) needs to drive
+    the raw ASGI lifespan protocol itself: send ``lifespan.startup``, wait
+    for the app's ``...complete`` reply, yield, then do the same for
+    ``lifespan.shutdown`` on the way out.
+    """
+    to_app: asyncio.Queue = asyncio.Queue()
+    from_app: asyncio.Queue = asyncio.Queue()
+
+    async def receive() -> dict:
+        return await to_app.get()
+
+    async def send(message: dict) -> None:
+        await from_app.put(message)
+
+    task = asyncio.create_task(app({"type": "lifespan"}, receive, send))
+    await to_app.put({"type": "lifespan.startup"})
+    started = await from_app.get()
+    assert started["type"] == "lifespan.startup.complete", started
+    try:
+        yield
+    finally:
+        await to_app.put({"type": "lifespan.shutdown"})
+        stopped = await from_app.get()
+        assert stopped["type"] == "lifespan.shutdown.complete", stopped
+        await task
+
+
 def state_of(app: FastAPI) -> ServerState:
     """Reach back into an app built by ``make_app``/``create_app`` for its
     ``ServerState`` — tests use this to inspect ``running``/``follow_ups``

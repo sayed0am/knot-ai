@@ -117,11 +117,19 @@ class AnthropicProvider:
         tools: Sequence[ToolSpec],
         signal: CancellationToken | None = None,
         session_id: str | None = None,
+        max_tokens: int | None = None,
+        thinking_budget_tokens: int | None = None,
     ) -> AsyncIterator[AssistantMessageEvent]:
         """Stream one response as assistant message events."""
         del session_id
         raw = self._stream_provider_events(
-            model=model, system=system, messages=messages, tools=tools, signal=signal
+            model=model,
+            system=system,
+            messages=messages,
+            tools=tools,
+            signal=signal,
+            max_tokens=max_tokens,
+            thinking_budget_tokens=thinking_budget_tokens,
         )
         return canonicalize_provider_stream(
             raw, api="anthropic-messages", provider="anthropic", model=model
@@ -135,6 +143,8 @@ class AnthropicProvider:
         messages: Sequence[AgentMessage],
         tools: Sequence[ToolSpec],
         signal: CancellationToken | None = None,
+        max_tokens: int | None = None,
+        thinking_budget_tokens: int | None = None,
     ) -> AsyncIterator[ProviderEvent]:
         async def iterator() -> AsyncIterator[ProviderEvent]:
             if signal is not None and signal.is_cancelled():
@@ -147,8 +157,14 @@ class AnthropicProvider:
                 system=system,
                 messages=messages,
                 tools=tools,
-                max_tokens=self._max_tokens,
-                thinking_budget_tokens=self._thinking_budget_tokens,
+                # Per-call values override this provider's own constructor
+                # defaults when given, same override direction as `model`.
+                max_tokens=max_tokens if max_tokens is not None else self._max_tokens,
+                thinking_budget_tokens=(
+                    thinking_budget_tokens
+                    if thinking_budget_tokens is not None
+                    else self._thinking_budget_tokens
+                ),
             )
             headers = {
                 "anthropic-version": ANTHROPIC_VERSION,

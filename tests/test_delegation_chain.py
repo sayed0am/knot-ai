@@ -71,7 +71,13 @@ async def test_delegation_chain_parks_restarts_and_resumes_end_to_end(tmp_path: 
             ),
         ]
     )
-    runtime = AgentRuntime(fleet=fleet, store=store, provider=provider, invariant_mode="strict")
+    runtime = AgentRuntime(
+        fleet=fleet,
+        store=store,
+        providers={"anthropic": provider},
+        default_provider="anthropic",
+        invariant_mode="strict",
+    )
     root_session = runtime.create_session("root")
 
     events = [
@@ -148,7 +154,13 @@ async def test_delegation_chain_parks_restarts_and_resumes_end_to_end(tmp_path: 
             reply("root: delegation complete, x has been researched"),
         ]
     )
-    runtime2 = AgentRuntime(fleet=fleet, store=store2, provider=provider2, invariant_mode="strict")
+    runtime2 = AgentRuntime(
+        fleet=fleet,
+        store=store2,
+        providers={"anthropic": provider2},
+        default_provider="anthropic",
+        invariant_mode="strict",
+    )
     outcomes = await runtime2.resume_chain(child_session_id)
 
     assert [o.outcome for o in outcomes] == ["completed", "completed"]

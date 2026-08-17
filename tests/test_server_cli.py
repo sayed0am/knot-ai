@@ -8,7 +8,16 @@ from pathlib import Path
 import pytest
 from authoring_fixtures import write_files
 
-from knot.server.cli import _cmd_serve, build_parser, resolve_invariant_mode
+from knot.authoring.compile import compile_fleet
+from knot.server.cli import (
+    DEFAULT_SERVING_PROVIDER,
+    ProviderStartupError,
+    _cmd_serve,
+    build_parser,
+    build_provider_registry,
+    resolve_invariant_mode,
+    resolve_serve_token,
+)
 
 
 def test_serve_parser_accepts_required_flags_with_defaults() -> None:
@@ -150,3 +159,134 @@ def test_serve_reports_an_invalid_invariant_mode_env_var_as_a_startup_error(
     )
     assert _cmd_serve(args) == 1
     assert "invalid KNOT_INVARIANT_MODE value" in capsys.readouterr().err
+
+
+# ---------------------------------------------------------------------------
+# Provider registry construction (design.md D2 / task 3.2/3.3): only the
+# providers a fleet actually references (plus the serving default) are
+# built, and an unknown/unconstructible one fails startup naming the
+# agent and provider.
+# ---------------------------------------------------------------------------
+
+
+def test_build_provider_registry_constructs_only_the_serving_default_for_a_bare_fleet(
+    tmp_path: Path, monkeypatch
+) -> None:
+    write_files(tmp_path, {"agents/root/instructions.md": "hi\n"})
+    fleet = compile_fleet(tmp_path)
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+
+    registry = build_provider_registry(fleet)
+
+    assert set(registry) == {DEFAULT_SERVING_PROVIDER}
+
+
+def test_build_provider_registry_constructs_every_referenced_provider(
+    tmp_path: Path, monkeypatch
+) -> None:
+    write_files(
+        tmp_path,
+        {
+            "agents/alpha/instructions.md": "hi\n",
+            "agents/alpha/agent.yaml": "model:\n  provider: anthropic\n  name: claude-x\n",
+            "agents/beta/instructions.md": "hi\n",
+            "agents/beta/agent.yaml": "model:\n  provider: openai\n  name: gpt-x\n",
+        },
+    )
+    fleet = compile_fleet(tmp_path)
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+
+    registry = build_provider_registry(fleet)
+
+    assert set(registry) == {"anthropic", "openai"}
+
+
+def test_build_provider_registry_reports_missing_credentials_naming_the_agent(
+    tmp_path: Path, monkeypatch
+) -> None:
+    write_files(tmp_path, {"agents/root/instructions.md": "hi\n"})
+    fleet = compile_fleet(tmp_path)
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+
+    with pytest.raises(ProviderStartupError, match="anthropic") as exc_info:
+        build_provider_registry(fleet)
+    assert "(serving default)" in str(exc_info.value)
+
+
+def test_build_provider_registry_reports_an_uninstalled_litellm_extra_naming_the_agent(
+    tmp_path: Path, monkeypatch
+) -> None:
+    write_files(
+        tmp_path,
+        {
+            "agents/root/instructions.md": "hi\n",
+            "agents/root/agent.yaml": "model:\n  provider: litellm\n  name: some-model\n",
+        },
+    )
+    fleet = compile_fleet(tmp_path)
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+
+    with pytest.raises(ProviderStartupError) as exc_info:
+        build_provider_registry(fleet)
+    message = str(exc_info.value)
+    assert "root" in message
+    assert "litellm" in message
+
+
+def test_serve_reports_an_unconstructible_provider_as_a_startup_error(
+    tmp_path: Path, capsys, monkeypatch
+) -> None:
+    write_files(
+        tmp_path,
+        {
+            "agents/root/instructions.md": "hi\n",
+            "agents/root/agent.yaml": "model:\n  provider: litellm\n  name: some-model\n",
+        },
+    )
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    args = argparse.Namespace(
+        root=str(tmp_path),
+        db=str(tmp_path / "sessions.db"),
+        host="127.0.0.1",
+        port=8000,
+        allow_broken=False,
+        invariant_mode=None,
+    )
+    assert _cmd_serve(args) == 1
+    err = capsys.readouterr().err
+    assert "root" in err
+    assert "litellm" in err
+
+
+# ---------------------------------------------------------------------------
+# Bearer-token resolution (design.md D9): explicit --token > $KNOT_SERVE_TOKEN
+# > no token (auth disabled) — same precedence convention as
+# resolve_invariant_mode, minus its "unknown value" validation.
+# ---------------------------------------------------------------------------
+
+
+def test_serve_token_defaults_to_none_with_no_explicit_value_and_no_env() -> None:
+    assert resolve_serve_token(None, env={}) is None
+
+
+def test_serve_token_env_var_is_used_when_no_explicit_flag() -> None:
+    assert resolve_serve_token(None, env={"KNOT_SERVE_TOKEN": "from-env"}) == "from-env"
+
+
+def test_serve_token_explicit_flag_wins_over_env_var() -> None:
+    assert resolve_serve_token("from-flag", env={"KNOT_SERVE_TOKEN": "from-env"}) == "from-flag"
+
+
+def test_serve_parser_accepts_token_flag() -> None:
+    parser = build_parser()
+    args = parser.parse_args(
+        ["serve", "--root", "/fleet", "--db", "/db.sqlite", "--token", "s3cret"]
+    )
+    assert args.token == "s3cret"
+
+
+def test_serve_parser_defaults_token_to_none_so_env_can_take_over() -> None:
+    parser = build_parser()
+    args = parser.parse_args(["serve", "--root", "/fleet", "--db", "/db.sqlite"])
+    assert args.token is None

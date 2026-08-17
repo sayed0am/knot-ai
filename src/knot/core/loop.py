@@ -111,6 +111,10 @@ async def run_agent_loop(
     max_turns: int | None = None,
     signal: CancellationToken | None = None,
     session_id: str | None = None,
+    max_tokens: int | None = None,
+    thinking_budget_tokens: int | None = None,
+    max_session_tokens: int | None = None,
+    session_tokens_baseline: int = 0,
     get_steering_messages: Callable[[], Sequence[AgentMessage]] | None = None,
     get_follow_up_messages: Callable[[], Sequence[AgentMessage]] | None = None,
     tool_decision_hook: ToolDecisionHook | None = None,
@@ -123,10 +127,27 @@ async def run_agent_loop(
 ) -> AsyncIterator[AgentEvent]:
     """Run the provider/tool loop, emitting the core agent event grammar.
 
+    ``max_tokens`` and ``thinking_budget_tokens`` are passed straight
+    through to every ``provider.stream_response`` call this run makes (design
+    D1); ``None`` (the default) leaves each provider's own constructor
+    defaults in effect.
+
     ``spill_sink`` threads alongside ``max_result_bytes`` down to
     ``execute_tool`` for every executed call (see
     ``knot.core.truncation.bound_tool_result``); ``None`` (the default)
     preserves today's plain-truncation behavior exactly.
+
+    ``max_session_tokens`` and ``session_tokens_baseline`` implement the
+    session token budget (design D6). ``session_tokens_baseline`` is the
+    usage already accumulated by prior runs of this session (from the
+    durable entry log — see ``knot.authoring.runtime._session_token_baseline``);
+    this run adds each ``AssistantMessage``'s own reported usage
+    (input + output + cache_read + cache_write) to that baseline as it goes.
+    Before every provider request — right next to the ``max_turns`` check —
+    if ``max_session_tokens`` is set and the running total has met or
+    exceeded it, the run ends with an error outcome naming the budget and
+    the amount consumed, and no provider request is made. ``None`` (the
+    default for ``max_session_tokens``) disables the check entirely.
 
     ``default_question_ttl_seconds`` sets ``PendingInputRequest.ttl_seconds``
     for execute-less (question) parks, e.g. ``ask_user``; ``None`` (the
@@ -179,8 +200,9 @@ async def run_agent_loop(
     pending_advisories: deque[AgentMessage] = deque()
     advisory_ids: set[int] = set()
 
+    turn = 1
     yield AgentStartEvent()
-    yield TurnStartEvent()
+    yield TurnStartEvent(turn=turn)
     async for event in _run_pre_turn_hook(pre_turn_hook, messages):
         yield event
     for message in prelude_messages:
@@ -192,21 +214,24 @@ async def run_agent_loop(
 
     if max_turns is not None and max_turns < 1:
         async for event in _end_with_error(
-            model, "max_turns must be at least 1", messages, new_messages
+            model, "max_turns must be at least 1", messages, new_messages, turn
         ):
             yield event
         return
 
     tool_by_name = {tool.name: tool for tool in tools}
-    turn = 1
     first_turn = True
     pending = tuple(get_steering_messages() if get_steering_messages else ())
+    # Running total for the session token budget (design D6): starts at the
+    # baseline computed from prior runs and grows by each AssistantMessage's
+    # own usage as this run produces one, checked pre-turn just below.
+    tokens_used = session_tokens_baseline
 
     while True:
         has_more_tools = True
         while has_more_tools or pending:
             if not first_turn:
-                yield TurnStartEvent()
+                yield TurnStartEvent(turn=turn)
                 async for event in _run_pre_turn_hook(pre_turn_hook, messages):
                     yield event
             first_turn = False
@@ -226,7 +251,23 @@ async def run_agent_loop(
 
             if max_turns is not None and turn > max_turns:
                 async for event in _end_with_error(
-                    model, f"Agent stopped after max_turns={max_turns}", messages, new_messages
+                    model,
+                    f"Agent stopped after max_turns={max_turns}",
+                    messages,
+                    new_messages,
+                    turn,
+                ):
+                    yield event
+                return
+
+            if max_session_tokens is not None and tokens_used >= max_session_tokens:
+                async for event in _end_with_error(
+                    model,
+                    f"session token budget exhausted: {tokens_used} >= "
+                    f"max_session_tokens={max_session_tokens}",
+                    messages,
+                    new_messages,
+                    turn,
                 ):
                     yield event
                 return
@@ -235,7 +276,9 @@ async def run_agent_loop(
                 try:
                     await pre_request_hook(messages)
                 except HistoryDivergenceError as exc:
-                    async for event in _end_with_error(model, str(exc), messages, new_messages):
+                    async for event in _end_with_error(
+                        model, str(exc), messages, new_messages, turn
+                    ):
                         yield event
                     return
 
@@ -251,6 +294,8 @@ async def run_agent_loop(
                 tools=tools,
                 signal=signal,
                 session_id=session_id,
+                max_tokens=max_tokens,
+                thinking_budget_tokens=thinking_budget_tokens,
             ):
                 yield event
                 if isinstance(event, MessageEndEvent) and isinstance(
@@ -270,8 +315,10 @@ async def run_agent_loop(
 
             messages.append(assistant)
             new_messages.append(assistant)
+            usage = assistant.usage
+            tokens_used += usage.input + usage.output + usage.cache_read + usage.cache_write
             if assistant.stop_reason in {"error", "aborted"}:
-                yield TurnEndEvent(message=assistant)
+                yield TurnEndEvent(turn=turn, message=assistant)
                 yield AgentEndEvent(
                     outcome=assistant.stop_reason, messages=new_messages, pending_requests=[]
                 )
@@ -307,14 +354,14 @@ async def run_agent_loop(
                     new_messages.append(result)
 
                 if signal is not None and signal.is_cancelled():
-                    yield TurnEndEvent(message=assistant, tool_results=tool_results)
+                    yield TurnEndEvent(turn=turn, message=assistant, tool_results=tool_results)
                     yield AgentEndEvent(
                         outcome="aborted", messages=new_messages, pending_requests=[]
                     )
                     return
 
                 if pending_requests:
-                    yield TurnEndEvent(message=assistant, tool_results=tool_results)
+                    yield TurnEndEvent(turn=turn, message=assistant, tool_results=tool_results)
                     yield AgentEndEvent(
                         outcome="waiting_input",
                         messages=new_messages,
@@ -322,7 +369,7 @@ async def run_agent_loop(
                     )
                     return
 
-            yield TurnEndEvent(message=assistant, tool_results=tool_results)
+            yield TurnEndEvent(turn=turn, message=assistant, tool_results=tool_results)
             turn += 1
             steering = tuple(get_steering_messages() if get_steering_messages else ())
             pending = tuple(pending_advisories) + steering
@@ -362,6 +409,8 @@ async def _assistant_events(
     tools: list[AgentTool],
     signal: CancellationToken | None,
     session_id: str | None,
+    max_tokens: int | None = None,
+    thinking_budget_tokens: int | None = None,
 ) -> AsyncIterator[AgentEvent]:
     source: AsyncIterator[AssistantMessageEvent] = provider.stream_response(
         model=model,
@@ -370,6 +419,8 @@ async def _assistant_events(
         tools=tools,
         signal=signal,
         session_id=session_id,
+        max_tokens=max_tokens,
+        thinking_budget_tokens=thinking_budget_tokens,
     )
     started = False
     async for event in source:
@@ -649,13 +700,14 @@ async def _end_with_error(
     text: str,
     messages: list[AgentMessage],
     new_messages: list[AgentMessage],
+    turn: int,
 ) -> AsyncIterator[AgentEvent]:
     error_message = _stopped_message(model, "error", text)
     messages.append(error_message)
     new_messages.append(error_message)
     yield MessageStartEvent(message=error_message)
     yield MessageEndEvent(message=error_message)
-    yield TurnEndEvent(message=error_message)
+    yield TurnEndEvent(turn=turn, message=error_message)
     yield AgentEndEvent(outcome="error", messages=new_messages, pending_requests=[])
 
 

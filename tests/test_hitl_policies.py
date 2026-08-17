@@ -62,6 +62,27 @@ async def test_longest_suffix_match_wins_among_candidates() -> None:
     assert isinstance(decision, Allow)  # the more specific "delete_customer" key wins
 
 
+async def test_ttls_thread_into_require_approval_for_the_always_policy() -> None:
+    hook = build_decision_hook({"sensitive_op": "always"}, ttls={"sensitive_op": 3600})
+    decision = await hook(ToolCall(id="c1", name="sensitive_op", arguments={}), None)
+    assert isinstance(decision, RequireApproval)
+    assert decision.ttl_seconds == 3600
+
+
+async def test_ttls_default_to_none_when_absent_or_unmatched() -> None:
+    hook = build_decision_hook({"sensitive_op": "always"}, ttls={"other_op": 60})
+    decision = await hook(ToolCall(id="c1", name="sensitive_op", arguments={}), None)
+    assert isinstance(decision, RequireApproval)
+    assert decision.ttl_seconds is None
+
+
+async def test_ttls_resolve_through_the_same_suffix_matching_rule_as_policies() -> None:
+    hook = build_decision_hook({"delete_customer": "always"}, ttls={"delete_customer": 120})
+    decision = await hook(ToolCall(id="c1", name="crm__delete_customer", arguments={}), None)
+    assert isinstance(decision, RequireApproval)
+    assert decision.ttl_seconds == 120
+
+
 async def test_custom_policy_callable_passthrough() -> None:
     async def custom(name: str, arguments, session_id):
         assert name == "custom_tool"

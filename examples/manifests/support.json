@@ -14,13 +14,15 @@
     "delegationMaxConcurrent": 1,
     "delegationMaxPerTurn": 2,
     "maxResultBytes": null,
+    "maxSessionTokens": null,
     "maxTurns": 12
   },
   "model": {
     "contextWindow": null,
     "maxTokens": 1024,
     "name": "claude-3-5-haiku-20241022",
-    "provider": "anthropic"
+    "provider": "anthropic",
+    "thinkingBudgetTokens": null
   },
   "repeatGuard": {
     "enabled": true,
@@ -74,7 +76,8 @@
         "type": "object"
       },
       "name": "ask_user",
-      "source": "builtin"
+      "source": "builtin",
+      "ttlSeconds": null
     },
     {
       "approval": "once",
@@ -102,7 +105,8 @@
         "type": "object"
       },
       "name": "flag_account",
-      "source": "bundle:crm"
+      "source": "bundle:crm",
+      "ttlSeconds": null
     },
     {
       "approval": "never",
@@ -125,7 +129,8 @@
         "type": "object"
       },
       "name": "load_skill",
-      "source": "builtin"
+      "source": "builtin",
+      "ttlSeconds": null
     },
     {
       "approval": "never",
@@ -147,7 +152,8 @@
         "type": "object"
       },
       "name": "lookup_order",
-      "source": "authored"
+      "source": "authored",
+      "ttlSeconds": null
     },
     {
       "approval": "never",
@@ -181,7 +187,8 @@
         "type": "object"
       },
       "name": "read_tool_output",
-      "source": "builtin"
+      "source": "builtin",
+      "ttlSeconds": null
     },
     {
       "approval": "never",
@@ -202,7 +209,8 @@
         "type": "object"
       },
       "name": "researcher",
-      "source": "subagent"
+      "source": "subagent",
+      "ttlSeconds": null
     },
     {
       "approval": "never",
@@ -223,7 +231,8 @@
         "type": "object"
       },
       "name": "support_mcp__add",
-      "source": "connection:crm/support_mcp"
+      "source": "connection:crm/support_mcp",
+      "ttlSeconds": null
     },
     {
       "approval": "always",
@@ -257,7 +266,8 @@
         "type": "object"
       },
       "name": "update_customer",
-      "source": "bundle:crm"
+      "source": "bundle:crm",
+      "ttlSeconds": null
     }
   ],
   "use": [

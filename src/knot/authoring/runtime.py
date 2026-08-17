@@ -44,9 +44,9 @@ from __future__ import annotations
 import asyncio
 import logging
 import uuid
-from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterator, Mapping, Sequence
 from contextlib import suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Literal
 
 from knot.authoring.compile import CompiledAgent, CompiledFleet
@@ -78,12 +78,23 @@ from knot.core.events import (
 )
 from knot.core.harness import AgentHarness, AgentHarnessConfig
 from knot.core.hitl.policies import build_decision_hook
-from knot.core.hitl.resume import is_ready_to_continue, write_child_completion
+from knot.core.hitl.resume import (
+    detect_crash_windows,
+    is_ready_to_continue,
+    repair_crash_windows,
+    write_child_completion,
+)
 from knot.core.invariant import InvariantMode, build_invariant_hook
 from knot.core.loop import emit_loop_event
 from knot.core.repeat_guard import RepeatGuardSettings
-from knot.core.session.entries import ENTRY_TYPE_COMPACTION, Compaction
+from knot.core.session.entries import (
+    ENTRY_TYPE_COMPACTION,
+    ENTRY_TYPE_MESSAGE,
+    Compaction,
+    entry_to_message,
+)
 from knot.core.session.persistence import PersistenceSubscriber
+from knot.core.session.queries import all_sessions
 from knot.core.session.state import DerivedState, derive_state, harness_from_session, rehydrate
 from knot.core.session.store import SessionRecord, SessionStore
 from knot.core.spill_tool import READ_TOOL_OUTPUT_TOOL_NAME, build_read_tool_output_tool
@@ -125,6 +136,21 @@ def _make_turn_reset_listener(turn_state: _DelegationTurnState) -> Callable[[Age
             turn_state.count = 0
 
     return listener
+
+
+def _iter_compiled_agents(agents: Mapping[str, CompiledAgent]) -> Iterator[CompiledAgent]:
+    """Yield every successfully-compiled agent in a fleet, top-level and
+    every nested subagent at any depth — the same population
+    ``_resolve_compiled_agent`` can ever return, just walked top-down
+    instead of following one session's own parent chain. A failed
+    (``ok=False``) agent has no manifest to read a provider off of, so it
+    is skipped here exactly as it already is everywhere else.
+    """
+    for compiled in agents.values():
+        if not compiled.ok:
+            continue
+        yield compiled
+        yield from _iter_compiled_agents(compiled.subagents)
 
 
 def _skill_listing_block(skills: Sequence[ManifestSkill]) -> str:
@@ -230,6 +256,29 @@ def _repeat_guard_settings(manifest: AgentManifest) -> RepeatGuardSettings:
     )
 
 
+def _session_token_baseline(store: SessionStore, session_id: str) -> int:
+    """Sum of provider-reported token usage across every persisted assistant
+    message in ``session_id`` (design D6).
+
+    Reads the raw entry log directly, never ``derive_state``'s compacted
+    projection: compaction folds the message entries it covers behind a
+    summary in that projection, but the underlying entries are append-only
+    and never rewritten, so summing over them keeps this total accurate —
+    and trivially restart-safe, since it is recomputed fresh every harness
+    build — regardless of how much compaction has run.
+    """
+    total = 0
+    for entry in store.entries(session_id):
+        if entry.type != ENTRY_TYPE_MESSAGE:
+            continue
+        message = entry_to_message(entry)
+        if not isinstance(message, AssistantMessage):
+            continue
+        usage = message.usage
+        total += usage.input + usage.output + usage.cache_read + usage.cache_write
+    return total
+
+
 async def _attempt_compaction(
     *,
     store: SessionStore,
@@ -315,11 +364,17 @@ async def _attempt_compaction(
 class AgentRuntime:
     """Turns a compiled fleet into live, runnable sessions and owns delegation.
 
-    Constructed once with the fleet, a durable session store, and a single
-    model provider (v0 is single-provider: every session, parent and every
-    descendant subagent alike, is served by the same ``provider`` object;
-    the model name comes from each agent's own manifest, or ``default_model``
-    when it has none). A later HTTP server package is meant to be a thin
+    Constructed once with the fleet, a durable session store, and a provider
+    registry (design D2): ``providers`` maps provider name to a live
+    ``ModelProvider``, and ``default_provider`` names the entry to use for
+    any agent whose manifest omits ``model.provider``. Every session —
+    top-level or a delegated child — resolves its provider from its OWN
+    compiled agent's manifest at harness-build time (see ``_build_harness``),
+    never from a parent's; the model name comes from each agent's own
+    manifest, or ``default_model`` when it has none. ``__init__`` validates
+    every compiled agent's ``model.provider`` against ``providers`` up
+    front, so an unresolvable provider fails at construction, not at the
+    first request. A later HTTP server package is meant to be a thin
     transport shell over the methods below.
     """
 
@@ -328,7 +383,8 @@ class AgentRuntime:
         *,
         fleet: CompiledFleet,
         store: SessionStore,
-        provider: ModelProvider,
+        providers: Mapping[str, ModelProvider],
+        default_provider: str,
         default_model: str = "default",
         max_result_bytes: int | None = None,
         connection_pool: ConnectionPool | None = None,
@@ -339,7 +395,8 @@ class AgentRuntime:
     ) -> None:
         self.fleet = fleet
         self.store = store
-        self.provider = provider
+        self.providers = providers
+        self.default_provider = default_provider
         self.default_model = default_model
         self.max_result_bytes = max_result_bytes
         #: Defaults to the module-global pool (see ``knot.authoring.mcp_client``)
@@ -355,6 +412,43 @@ class AgentRuntime:
         #: relying on this default — production degrades a false positive
         #: to telemetry, tests ratchet on strict.
         self.invariant_mode = invariant_mode
+        self._validate_provider_routing()
+
+    def _validate_provider_routing(self) -> None:
+        """Fail fast at construction, not at first request (design D2/spec
+        "Unknown provider rejected at startup"): every compiled agent's
+        resolved provider name — ``model.provider`` if it has a ``model``
+        block, else ``default_provider`` — must have an entry in
+        ``providers``. Also checked for ``default_provider`` itself, since
+        an agent with no ``model`` block resolves to it without ever
+        appearing in the loop below.
+        """
+        if self.default_provider not in self.providers:
+            raise ValueError(
+                f"default_provider {self.default_provider!r} has no entry in "
+                f"the providers mapping ({', '.join(sorted(self.providers)) or 'none'})"
+            )
+        for compiled in _iter_compiled_agents(self.fleet.agents):
+            manifest = compiled.manifest
+            assert manifest is not None  # ok=True always has a manifest
+            provider_name = (
+                manifest.model.provider if manifest.model is not None else self.default_provider
+            )
+            if provider_name not in self.providers:
+                raise ValueError(
+                    f"agent {compiled.agent_id!r} configures model.provider "
+                    f"{provider_name!r}, which has no entry in the providers mapping "
+                    f"({', '.join(sorted(self.providers)) or 'none'})"
+                )
+
+    def _resolve_provider(self, manifest: AgentManifest) -> ModelProvider:
+        """One session's provider, resolved from its OWN agent's manifest
+        (design D2) — never a parent's. ``_validate_provider_routing``
+        already guarantees this lookup can't miss."""
+        provider_name = (
+            manifest.model.provider if manifest.model is not None else self.default_provider
+        )
+        return self.providers[provider_name]
 
     # -- session identity --------------------------------------------------
 
@@ -457,9 +551,13 @@ class AgentRuntime:
         tools: list[AgentTool] = [*live_capability_tools, *delegation_tools]
 
         policies = {tool.name: tool.approval for tool in manifest.tools}
-        hook = build_decision_hook(policies, store=self.store, session_id=session_id)
+        ttls = {
+            tool.name: tool.ttl_seconds for tool in manifest.tools if tool.ttl_seconds is not None
+        }
+        hook = build_decision_hook(policies, store=self.store, session_id=session_id, ttls=ttls)
 
         model_name = manifest.model.name if manifest.model is not None else self.default_model
+        provider = self._resolve_provider(manifest)
         max_result_bytes = self._max_result_bytes(manifest)
 
         # Every harness this method builds is store-backed by construction
@@ -479,6 +577,7 @@ class AgentRuntime:
         )
         pre_turn_hook = self._build_pre_turn_hook(
             session_id=session_id,
+            provider=provider,
             model=model_name,
             system=system,
             tools=tools,
@@ -487,13 +586,26 @@ class AgentRuntime:
         )
 
         config = AgentHarnessConfig(
-            provider=self.provider,
+            provider=provider,
             model=model_name,
             system=system,
             tools=tools,
             session_id=session_id,
             tool_decision_hook=hook,
             max_turns=manifest.limits.max_turns,
+            max_tokens=manifest.model.max_tokens if manifest.model is not None else None,
+            thinking_budget_tokens=(
+                manifest.model.thinking_budget_tokens if manifest.model is not None else None
+            ),
+            max_session_tokens=manifest.limits.max_session_tokens,
+            # Only scanned when a budget is actually configured — an unset
+            # budget must cost nothing extra (spec: "no budget check
+            # occurs"), not even the entry-log read.
+            session_tokens_baseline=(
+                _session_token_baseline(self.store, session_id)
+                if manifest.limits.max_session_tokens is not None
+                else 0
+            ),
             max_result_bytes=max_result_bytes,
             pre_request_hook=invariant_hook,
             pre_turn_hook=pre_turn_hook,
@@ -509,6 +621,7 @@ class AgentRuntime:
         self,
         *,
         session_id: str,
+        provider: ModelProvider,
         model: str,
         system: str,
         tools: list[AgentTool],
@@ -520,7 +633,8 @@ class AgentRuntime:
         ``None`` when compaction is disabled outright, matching the "cheap
         when disabled" pattern ``build_invariant_hook`` already uses (see
         ``_build_harness``). Deliberately harness-reference-free: it closes
-        only over ``self.store``/``self.provider`` and the per-session
+        only over ``self.store``, the caller-resolved ``provider`` (this
+        session's own agent's provider — design D2), and the per-session
         values captured above, so ``run_agent_loop``'s pre-turn contract
         (mutate the ``messages`` list it is given, nothing else) is the only
         thing this needs to satisfy — see ``knot.core.loop.run_agent_loop``.
@@ -548,7 +662,7 @@ class AgentRuntime:
             events, new_messages = await _attempt_compaction(
                 store=self.store,
                 session_id=session_id,
-                provider=self.provider,
+                provider=provider,
                 model=model,
                 system=system,
                 tools=tools,
@@ -1086,5 +1200,85 @@ class AgentRuntime:
 
         return outcomes
 
+    # -- serve-time crash-window repair (design D8) -------------------------
 
-__all__ = ["AgentRuntime"]
+    async def repair_all_crash_windows(self) -> CrashWindowRepairSummary:
+        """Sweep every persisted session for an approved-but-unfinished tool
+        execution and repair what it safely can, before the server starts
+        accepting requests (called from the FastAPI lifespan in
+        ``knot.server.app``).
+
+        Each session's live tool set is built through ``build_live_tools``
+        — the same fully-wired set (connection executors, delegation tools,
+        everything) a real turn would run with — so an auto-repaired
+        idempotent call executes exactly like a live one. A session whose
+        agent can no longer be resolved (removed from the fleet, or now
+        failing to compile) is never crashed on: ``detect_crash_windows``
+        doesn't actually need a live tool set to find windows (only
+        ``repair_crash_windows`` does, to check idempotency), so its
+        windows are still detected and reported — just always as
+        ``needs_operator``, since there is no live tool to safely
+        auto-repair against.
+        """
+        repaired_count = 0
+        needs_operator: list[CrashWindowNeedsOperator] = []
+
+        for record in all_sessions(self.store):
+            try:
+                tools = self.build_live_tools(record.session_id)
+            except Exception as exc:  # noqa: BLE001 - an unresolvable agent must not abort the sweep
+                for window in detect_crash_windows(self.store, record.session_id, {}):
+                    needs_operator.append(
+                        CrashWindowNeedsOperator(
+                            session_id=record.session_id,
+                            tool_call_id=window.tool_call_id,
+                            tool_name=window.tool_name,
+                            reason=f"session's agent could not be resolved: {exc}",
+                        )
+                    )
+                continue
+
+            report = await repair_crash_windows(
+                self.store,
+                record.session_id,
+                tools,
+                spill_sink=self.build_spill_sink(record.session_id),
+            )
+            repaired_count += len(report.repaired)
+            for window in report.needs_operator:
+                needs_operator.append(
+                    CrashWindowNeedsOperator(
+                        session_id=record.session_id,
+                        tool_call_id=window.tool_call_id,
+                        tool_name=window.tool_name,
+                        reason=f"tool {window.tool_name!r} is not idempotent",
+                    )
+                )
+
+        return CrashWindowRepairSummary(
+            repaired_count=repaired_count, needs_operator=needs_operator
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class CrashWindowNeedsOperator:
+    """One crash window ``AgentRuntime.repair_all_crash_windows`` could not
+    auto-repair: surfaced by ``GET /crash-windows`` until an operator
+    resolves it via ``POST /crash-windows/skip``
+    (``knot.core.hitl.resume.operator_skip``)."""
+
+    session_id: str
+    tool_call_id: str
+    tool_name: str
+    reason: str
+
+
+@dataclass(frozen=True, slots=True)
+class CrashWindowRepairSummary:
+    """The result of one ``AgentRuntime.repair_all_crash_windows`` sweep."""
+
+    repaired_count: int
+    needs_operator: list[CrashWindowNeedsOperator] = field(default_factory=list)
+
+
+__all__ = ["AgentRuntime", "CrashWindowNeedsOperator", "CrashWindowRepairSummary"]

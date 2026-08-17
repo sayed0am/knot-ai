@@ -61,6 +61,7 @@ class AgentStartEvent(WireModel):
 
 class TurnStartEvent(WireModel):
     type: Literal["turn_start"] = "turn_start"
+    turn: int
 
 
 class MessageStartEvent(WireModel):
@@ -84,6 +85,7 @@ class ToolExecutionStartEvent(WireModel):
     tool_call_id: str
     tool_name: str
     args: dict[str, JSONValue] = Field(default_factory=dict)
+    timestamp: int = Field(default_factory=current_timestamp_ms)
 
 
 class ToolExecutionUpdateEvent(WireModel):
@@ -92,6 +94,7 @@ class ToolExecutionUpdateEvent(WireModel):
     tool_name: str
     args: dict[str, JSONValue] = Field(default_factory=dict)
     partial_result: AgentToolResult
+    timestamp: int = Field(default_factory=current_timestamp_ms)
 
 
 class ToolExecutionEndEvent(WireModel):
@@ -100,10 +103,12 @@ class ToolExecutionEndEvent(WireModel):
     tool_name: str
     result: AgentToolResult
     is_error: bool
+    timestamp: int = Field(default_factory=current_timestamp_ms)
 
 
 class TurnEndEvent(WireModel):
     type: Literal["turn_end"] = "turn_end"
+    turn: int
     message: AgentMessage
     tool_results: list[ToolResultMessage] = Field(default_factory=list)
 

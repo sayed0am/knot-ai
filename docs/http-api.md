@@ -7,9 +7,23 @@ chain. Every JSON shape below is a real, captured example (generated
 against [`examples/fleet`](../examples/fleet) with a scripted fake model —
 see `tests/test_e2e_scenarios.py`), not a hand-written guess.
 
-One app instance (`create_app`) serves one compiled fleet. There is no
-authentication layer in v0 — that's a deployment concern, not part of this
-API.
+One app instance (`create_app`) serves one compiled fleet.
+
+**Auth is opt-in and off by default.** With no token configured (the
+default), every endpoint behaves exactly as documented below, with no auth
+requirement at all. Start `knot serve --token <value>` (or set
+`KNOT_SERVE_TOKEN`; an explicit `--token` wins if both are given) to require
+`Authorization: Bearer <value>` on **every** request, including the SSE
+streams — a request with a missing or wrong token gets `401` with a generic
+`{"detail": "unauthorized"}` body and a `WWW-Authenticate: Bearer` header
+before any route handler runs; the response never reveals the configured
+token or whether a guess was "close". `create_app(..., auth_token=...)` is
+the equivalent for a caller embedding the app directly rather than going
+through the CLI.
+
+```
+curl -H "Authorization: Bearer $KNOT_SERVE_TOKEN" http://localhost:8000/agents
+```
 
 ## The turn-stitched model, in one paragraph
 
@@ -96,6 +110,31 @@ Start a turn with a new user message. Body: `{"text": "..."}`.
   not survive a server restart** (see [State semantics](#state-semantics)).
 - `404` — unknown session. `409` — the session already has a run in flight.
 
+### `POST /sessions/{session_id}/steer`
+
+Inject guidance into a session's **currently in-flight** run. Body:
+`{"message": "..."}` (a non-empty string; `422` otherwise).
+
+- `202 {"delivered": true}` on success. The message is handed to
+  `AgentHarness.steer` and reaches the model at the run's *next turn
+  boundary* — no new stream, no restart. It is durably logged as an
+  ordinary `"message"` entry the moment the loop drains it (same
+  `MessageEndEvent` → `PersistenceSubscriber` path a prompted user message
+  takes; no bespoke entry type), so it shows up in the session's transcript
+  like anything else the model saw.
+- `404` — unknown session.
+- `409` — the session has no run in progress right now (idle, waiting, or
+  already finished) — points the caller at `POST /sessions/{id}/messages`
+  instead.
+
+**Steer vs. `/messages`, precisely:** `/steer` only ever affects a run that
+is *already streaming* — it reaches that same run at its next turn. Posting
+to `/messages` while a session is running is rejected (`409`); posting to
+`/messages` while a session is merely `waiting` (parked) queues the text as
+a **follow-up**, delivered only *after* that run resumes and completes via
+`/continue`. The two channels never overlap: steering never queues, and a
+follow-up never reaches the run that's currently in flight.
+
 ### `POST /sessions/{session_id}/continue`
 
 Resume a parked, now-ready session (every pending request resolved, no
@@ -180,6 +219,7 @@ resolves those directly):
     "rootSessionId": "sess_3f1688f90f6d409f9577346f2fc478c7",
     "path": [{"sessionId": "sess_3f1688f90f6d409f9577346f2fc478c7", "agentId": "support"}],
     "ageSeconds": 0.003,
+    "ttlSeconds": 3600,
     "payload": {"args": {"customer_id": "CUST-1", "field": "tier", "value": "gold"}},
     "createdAt": 1786712242219
   }
@@ -192,6 +232,13 @@ that actually owns the park, `rootSessionId` is the top-level session, and
 owning session — enough to render "support → researcher: search_notes
 needs approval" in an inbox UI without a second round trip. `status` only
 supports `"pending"` today — anything else is `422`.
+
+`ttlSeconds` is the TTL configured on the tool's approval policy (see the
+`approvals` object form in `docs/authoring-agents.md`) — `null` when the
+tool's approval never expires on its own. Paired with `ageSeconds`, it's
+enough for an inbox UI to render a countdown; once a request's age exceeds
+its TTL, the existing expiry sweep durably denies it and it drops out of
+this list on its own, with no separate expiry notification.
 
 ### `GET /connections/health`
 
@@ -208,6 +255,51 @@ tools against its committed snapshot, without writing anything:
 committed snapshot), or `"unreachable"` (with an added `"error"` field).
 This never fails the request as a whole — one connection's failure is just
 one row with `status: "unreachable"`.
+
+## Startup crash-window repair
+
+Before `knot serve` accepts its first request, it sweeps every persisted
+session for a *crash window*: a tool call that was approved and started
+executing but never produced a result — exactly what a process crash
+between those two durable writes leaves behind (see
+`knot.core.hitl.resume`). A window whose tool is declared idempotent is
+re-executed automatically and its result is durably recorded, with no
+operator involvement. A window whose tool is **not** idempotent is left
+alone — silently re-running a non-idempotent side effect is never safe —
+and is instead surfaced through the two endpoints below; the session it
+belongs to stays parked until an operator resolves it.
+
+This repair runs exactly once, at startup, before the app serves any
+request; it never re-scans while the server is running (there is nothing
+new to find — a fresh crash window can only appear from this same
+process's own crash, which means a different process performs the next
+sweep, on its own next startup).
+
+### `GET /crash-windows`
+
+Every crash window still needing operator resolution, snapshotted at
+startup:
+
+```json
+[
+  {"sessionId": "sess_...", "toolCallId": "call_risky", "toolName": "risky_write", "reason": "tool 'risky_write' is not idempotent"}
+]
+```
+
+### `POST /crash-windows/skip`
+
+Resolve one listed window without re-running it. Body:
+
+```json
+{"sessionId": "sess_...", "toolCallId": "call_risky"}
+```
+
+Appends a durable error tool result attributing the skip to the operator
+(`"Operator skip by operator: <reason>"`), so the session's dangling tool
+call is resolved and it becomes resumable via the ordinary
+`/input`/`/continue` flow. `200` with the resolved window; `404` if no
+listed window matches the given `sessionId`/`toolCallId` (already skipped,
+or never existed).
 
 ## The SSE wire protocol
 
@@ -230,12 +322,12 @@ the wire.
 | `type` | Fields (beyond `type`) | When |
 |---|---|---|
 | `agent_start` | — | Once, at the very start of the run. |
-| `turn_start` | — | Once per model turn. |
+| `turn_start` | `turn` | Once per model turn. `turn` is the 1-based turn number within this run. |
 | `message_start` / `message_update` / `message_end` | `message: AgentMessage` (`message_update` also carries `assistantMessageEvent`) | Streaming lifecycle of one message — the user message that started the turn, then the assistant's reply as it streams in. |
-| `tool_execution_start` | `toolCallId, toolName, args` | A tool call is about to run. |
-| `tool_execution_update` | `..., partialResult` | A tool reported incremental progress (rare; most tools don't). |
-| `tool_execution_end` | `toolCallId, toolName, result, isError` | A tool call finished (or failed). If the result's text exceeded the agent's `max_result_bytes`, `result` is the bounded preview+notice, not the full text — see [An oversized result, spilled](#an-oversized-result-spilled) below. |
-| `turn_end` | `message, toolResults` | One model turn's assistant message plus any tool results produced for it. |
+| `tool_execution_start` | `toolCallId, toolName, args, timestamp` | A tool call is about to run. `timestamp` is milliseconds since epoch, taken when the event is emitted. |
+| `tool_execution_update` | `..., partialResult, timestamp` | A tool reported incremental progress (rare; most tools don't). |
+| `tool_execution_end` | `toolCallId, toolName, result, isError, timestamp` | A tool call finished (or failed). Subtracting this `timestamp` from the matching `tool_execution_start`'s yields that call's duration. If the result's text exceeded the agent's `max_result_bytes`, `result` is the bounded preview+notice, not the full text — see [An oversized result, spilled](#an-oversized-result-spilled) below. |
+| `turn_end` | `turn, message, toolResults` | One model turn's assistant message plus any tool results produced for it. `turn` matches the `turn_start` that opened it. |
 | `subagent_called` | `toolCallId, subagentId, childSessionId` | A delegation call just created a child session — control-plane only, not durably recorded. |
 | `subagent_completed` | `toolCallId, subagentId, childSessionId, outcome` | That child session reached *some* terminal state for this call — `outcome` is the child's own `agent_end.outcome`, including `"waiting_input"` if the child itself parked. |
 | `compaction` | `coversThroughSeq, summaryBytes, trigger` | The session's history was just compacted — see [Context compaction](#context-compaction) below. Control-plane only, like `subagent_called`; the durable fact is the `"compaction"` session entry, already appended by the time this frame is sent. |
@@ -256,7 +348,7 @@ event: agent_start
 data: {"type":"agent_start"}
 
 event: turn_start
-data: {"type":"turn_start"}
+data: {"type":"turn_start","turn":1}
 
 event: message_start
 data: {"type":"message_start","message":{"role":"user","content":"Where is order ORD-1001?","timestamp":1786712230138}}
@@ -280,7 +372,7 @@ event: message_end
 data: {"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"Order ORD-1001 shipped via UPS and should arrive 2026-08-16."}], ...}}
 
 event: turn_end
-data: {"type":"turn_end","message":{...},"toolResults":[]}
+data: {"type":"turn_end","turn":1,"message":{...},"toolResults":[]}
 
 event: agent_end
 data: {"type":"agent_end","outcome":"completed","messages":[{"role":"user", ...},{"role":"assistant", ...}],"pendingRequests":[]}
@@ -301,7 +393,7 @@ event: message_end
 data: {"type":"message_end","message":{"role":"assistant","content":[{"type":"toolCall","id":"call_uc","name":"update_customer","arguments":{"customer_id":"CUST-1","field":"tier","value":"gold"}}], ...}}
 
 event: turn_end
-data: {"type":"turn_end","message":{...},"toolResults":[]}
+data: {"type":"turn_end","turn":1,"message":{...},"toolResults":[]}
 
 event: agent_end
 data: {"type":"agent_end","outcome":"waiting_input","messages":[...],"pendingRequests":[{"id":"req_e4f29844fcca4a2f92f67eb046a233ab","kind":"tool_approval","toolCallId":"call_uc","toolName":"update_customer","payload":{"args":{"customer_id":"CUST-1","field":"tier","value":"gold"}},"createdAt":1786712242219,"ttlSeconds":null}]}
@@ -327,7 +419,7 @@ content with the always-available `read_tool_output` tool, called with
 
 ```
 event: tool_execution_end
-data: {"type":"tool_execution_end","toolCallId":"call_lookup","toolName":"lookup_order","result":{"content":[{"type":"text","text":"Order O\n[... 406 bytes omitted ...]\n6-08-20.\n[spilled: result was 421 bytes, limit 200. Full content stored; retrieve with read_tool_output(ref=\"call_lookup\") using offsetBytes/limitBytes or pattern.]","textSignature":null}],"details":{"spilled":true,"original_bytes":421,"ref":"call_lookup"}},"isError":false}
+data: {"type":"tool_execution_end","toolCallId":"call_lookup","toolName":"lookup_order","result":{"content":[{"type":"text","text":"Order O\n[... 406 bytes omitted ...]\n6-08-20.\n[spilled: result was 421 bytes, limit 200. Full content stored; retrieve with read_tool_output(ref=\"call_lookup\") using offsetBytes/limitBytes or pattern.]","textSignature":null}],"details":{"spilled":true,"original_bytes":421,"ref":"call_lookup"}},"isError":false,"timestamp":1786712242219}
 ```
 
 A result within the cap carries `details: null` (or whatever the tool
@@ -454,7 +546,7 @@ continue its parent, and so on up to the root.
   compaction summary (see [Context compaction](#context-compaction) above)
   is also a `user`-role message, distinguishable by its
   `<compacted-summary>...</compacted-summary>`-wrapped `content`.
-- **`assistant`** — `{"role": "assistant", "content": [TextContent | ThinkingContent | ToolCall, ...], "api", "provider", "model", "usage", "stopReason", "errorMessage", "timestamp", ...}`. A `ToolCall` content block is `{"type": "toolCall", "id", "name", "arguments"}`.
+- **`assistant`** — `{"role": "assistant", "content": [TextContent | ThinkingContent | ToolCall, ...], "api", "provider", "model", "usage", "stopReason", "errorMessage", "timestamp", ...}`. A `ToolCall` content block is `{"type": "toolCall", "id", "name", "arguments"}`. `usage.cost` is **`null` unless the provider reported an actual USD cost for that response** — never an all-zeros stand-in for "unknown" (**BREAKING**: previously always `{"input", "output", "cacheRead", "cacheWrite", "total"}`, all zero by default; a consumer reading `.cost.total` must now handle `usage.cost` itself being `null`, not just its fields). Today only the litellm provider populates it, and only `total` — the category fields (`input`, `output`, `cacheRead`, `cacheWrite`) stay `null` when a provider reports just a total, never computed locally.
 - **`toolResult`** — `{"role": "toolResult", "toolCallId", "toolName", "content": [...], "details", "isError", "timestamp"}`. This is what a delegation call's result looks like in the *parent's* transcript too: `toolName` is the subagent's id, and `content` is the child's final answer text. `details` is normally `null`; for a spilled result it is `{"spilled": true, "original_bytes", "ref"}` and `content` is the bounded preview, never the full text — see [An oversized result, spilled](#an-oversized-result-spilled) above.
 - **`custom`** — an escape hatch for provider-specific message shapes; not produced by anything described in this document.
 
@@ -492,11 +584,19 @@ the session's state).
 | `POST /agents/{id}/sessions` | unknown agent | agent failed to compile | `201` on success |
 | `GET /sessions/{id}` | unknown session | — | — |
 | `POST .../messages` | unknown session | a run is already in flight | `202` if queued (session was `waiting`) |
+| `POST .../steer` | unknown session | no run in progress (idle/waiting/finished) | `422` if `message` is empty; `202 {"delivered": true}` on success |
 | `POST .../continue` | unknown session | a run is already in flight, or the session isn't ready to continue | — |
 | `POST .../input` | unknown session | every targeted request id was rejected | `200` even on partial success |
 | `POST .../cancel` | unknown session | — | `{"cancelled": false, ...}` if nothing was running |
 | `GET /approvals` | — | — | `422` if `status` isn't `pending` |
 | `GET /connections/health` | — | — | never fails as a whole; per-row `"unreachable"` |
+| `GET /crash-windows` | — | — | — |
+| `POST /crash-windows/skip` | no matching listed window | — | `200` with the resolved window on success |
+
+Every request also gets `401 {"detail": "unauthorized"}` (before any of the
+above ever runs) if the server was started with a token and the request's
+`Authorization` header is missing or wrong — see the auth note at the top
+of this document.
 
 Every error body follows FastAPI's default `HTTPException` shape,
 `{"detail": "<message>"}`, except the two endpoints noted above that return

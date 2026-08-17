@@ -15,6 +15,7 @@ from knot.providers.messages import (
     ToolCall,
     ToolResultMessage,
     Usage,
+    UsageCost,
     UserMessage,
     assistant_content,
     content_text,
@@ -153,6 +154,22 @@ def test_message_text_delegates_to_text_property() -> None:
     assert message_text(assistant) == "hello"
     assert message_text(tool_result) == "ok"
     assert message_text(custom) == "note text"
+
+
+def test_usage_cost_defaults_to_none_and_serializes_null() -> None:
+    message = AssistantMessage(content="hello")
+    assert message.usage.cost is None
+    dumped = message.model_dump_json(by_alias=True)
+    assert '"cost":null' in dumped
+
+
+def test_usage_cost_with_total_only_leaves_categories_null() -> None:
+    usage = Usage(input=10, output=5, total_tokens=15, cost=UsageCost(total=0.01))
+    restored, dumped = _round_trip(usage)
+    assert restored == usage
+    assert dumped["cost"]["total"] == 0.01
+    assert dumped["cost"]["input"] is None
+    assert dumped["cost"]["cacheRead"] is None
 
 
 def test_message_to_user_converts_custom_message() -> None:

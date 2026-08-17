@@ -73,11 +73,20 @@ class ModelProvider(Protocol):
         tools: Sequence[ToolSpec],
         signal: CancellationToken | None = None,
         session_id: str | None = None,
+        max_tokens: int | None = None,
+        thinking_budget_tokens: int | None = None,
     ) -> AsyncIterator[AssistantMessageEvent]:
         """Stream one model response as assistant message events.
 
         Providers may use ``session_id`` for request routing or prompt-cache
         affinity. Unsupported providers ignore it.
+
+        ``max_tokens`` and ``thinking_budget_tokens`` are per-call overrides
+        of a provider's own constructor defaults (design D1): a provider
+        that cannot honor one of them ignores it at request time rather than
+        raising — the compile-time diagnostic in
+        ``knot.authoring.compile`` is what keeps that silent-ignore case from
+        actually happening for thinking budgets.
         """
         ...
 

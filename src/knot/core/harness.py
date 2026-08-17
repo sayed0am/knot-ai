@@ -62,6 +62,15 @@ class AgentHarnessConfig:
     system: str
     tools: list[AgentTool] = field(default_factory=list)
     max_turns: int | None = None
+    max_tokens: int | None = None
+    thinking_budget_tokens: int | None = None
+    # Session token budget (design D6): `max_session_tokens` is the
+    # configured ceiling (`None` disables the check entirely) and
+    # `session_tokens_baseline` is the usage already accumulated by prior
+    # runs of this session, summed from the durable entry log at harness
+    # build time (see `knot.authoring.runtime._session_token_baseline`).
+    max_session_tokens: int | None = None
+    session_tokens_baseline: int = 0
     queue_mode: QueueMode = "one_at_a_time"
     session_id: str | None = None
     tool_decision_hook: ToolDecisionHook | None = None
@@ -237,6 +246,10 @@ class AgentHarness:
                 prelude_messages=repairs,
                 tools=self._config.tools,
                 max_turns=self._config.max_turns,
+                max_tokens=self._config.max_tokens,
+                thinking_budget_tokens=self._config.thinking_budget_tokens,
+                max_session_tokens=self._config.max_session_tokens,
+                session_tokens_baseline=self._config.session_tokens_baseline,
                 signal=signal,
                 session_id=self._config.session_id,
                 get_steering_messages=self._drain_steering_messages,

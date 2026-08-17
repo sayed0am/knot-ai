@@ -12,6 +12,7 @@ import asyncio
 import logging
 from pathlib import Path
 
+import pytest
 from authoring_fixtures import write_files
 
 from knot.authoring.compile import compile_fleet
@@ -23,7 +24,14 @@ from knot.core.session.queries import child_chain
 from knot.core.session.state import derive_state
 from knot.core.tools import AgentTool, AgentToolResult
 from knot.providers.fake import FakeProvider, error, reply, tool_call
-from knot.providers.messages import ToolCall, ToolResultMessage, UserMessage
+from knot.providers.messages import (
+    AssistantMessage,
+    TextContent,
+    ToolCall,
+    ToolResultMessage,
+    Usage,
+    UserMessage,
+)
 
 
 def _single_subagent_fleet(tmp_path: Path, *, limits: str = "") -> None:
@@ -53,7 +61,13 @@ async def test_synchronous_delegation_completes_within_one_turn(tmp_path: Path) 
             reply("root says: 42"),
         ]
     )
-    runtime = AgentRuntime(fleet=fleet, store=store, provider=provider, invariant_mode="strict")
+    runtime = AgentRuntime(
+        fleet=fleet,
+        store=store,
+        providers={"anthropic": provider},
+        default_provider="anthropic",
+        invariant_mode="strict",
+    )
     session = runtime.create_session("root")
 
     events = [event async for event in runtime.run_turn(session.session_id, "research x")]
@@ -89,7 +103,13 @@ async def test_delegation_emits_subagent_called_and_completed_control_events(
             reply("root says: 42"),
         ]
     )
-    runtime = AgentRuntime(fleet=fleet, store=store, provider=provider, invariant_mode="strict")
+    runtime = AgentRuntime(
+        fleet=fleet,
+        store=store,
+        providers={"anthropic": provider},
+        default_provider="anthropic",
+        invariant_mode="strict",
+    )
     session = runtime.create_session("root")
 
     events = [event async for event in runtime.run_turn(session.session_id, "research x")]
@@ -129,7 +149,13 @@ async def test_delegation_cap_exceeded_produces_error_result_naming_the_cap(
         ToolCall(id="c2", name="researcher", arguments={"message": "b"}),
     ]
     provider = FakeProvider([reply(tool_calls=calls), reply("ok"), reply("done")])
-    runtime = AgentRuntime(fleet=fleet, store=store, provider=provider, invariant_mode="strict")
+    runtime = AgentRuntime(
+        fleet=fleet,
+        store=store,
+        providers={"anthropic": provider},
+        default_provider="anthropic",
+        invariant_mode="strict",
+    )
     session = runtime.create_session("root")
 
     events = [event async for event in runtime.run_turn(session.session_id, "go")]
@@ -163,7 +189,13 @@ async def test_child_failure_produces_error_result_and_parent_turn_continues(
             reply("sorry, that failed, moving on"),
         ]
     )
-    runtime = AgentRuntime(fleet=fleet, store=store, provider=provider, invariant_mode="strict")
+    runtime = AgentRuntime(
+        fleet=fleet,
+        store=store,
+        providers={"anthropic": provider},
+        default_provider="anthropic",
+        invariant_mode="strict",
+    )
     session = runtime.create_session("root")
 
     events = [event async for event in runtime.run_turn(session.session_id, "go")]
@@ -199,7 +231,12 @@ async def test_delegation_result_over_parent_cap_is_spilled_by_parents_own_sink(
         ]
     )
     runtime = AgentRuntime(
-        fleet=fleet, store=store, provider=provider, max_result_bytes=200, invariant_mode="strict"
+        fleet=fleet,
+        store=store,
+        providers={"anthropic": provider},
+        default_provider="anthropic",
+        max_result_bytes=200,
+        invariant_mode="strict",
     )
     session = runtime.create_session("root")
 
@@ -268,7 +305,18 @@ async def test_parallel_delegations_to_two_subagents_run_concurrently(tmp_path: 
                 reply("both done"),
             ]
 
-        def stream_response(self, *, model, system, messages, tools, signal=None, session_id=None):
+        def stream_response(
+            self,
+            *,
+            model,
+            system,
+            messages,
+            tools,
+            signal=None,
+            session_id=None,
+            max_tokens=None,
+            thinking_budget_tokens=None,
+        ):
             key = "a" if "INSTR_a" in system else "b" if "INSTR_b" in system else None
             if key is not None:
 
@@ -289,7 +337,13 @@ async def test_parallel_delegations_to_two_subagents_run_concurrently(tmp_path: 
             return gen2()
 
     provider = GatedProvider()
-    runtime = AgentRuntime(fleet=fleet, store=store, provider=provider, invariant_mode="strict")
+    runtime = AgentRuntime(
+        fleet=fleet,
+        store=store,
+        providers={"anthropic": provider},
+        default_provider="anthropic",
+        invariant_mode="strict",
+    )
     session = runtime.create_session("root")
 
     async def drain() -> AgentEndEvent:
@@ -342,7 +396,18 @@ async def test_concurrency_semaphore_bounds_overlapping_delegations(tmp_path: Pa
                 reply("all three done"),
             ]
 
-        def stream_response(self, *, model, system, messages, tools, signal=None, session_id=None):
+        def stream_response(
+            self,
+            *,
+            model,
+            system,
+            messages,
+            tools,
+            signal=None,
+            session_id=None,
+            max_tokens=None,
+            thinking_budget_tokens=None,
+        ):
             key = next((k for k in started if f"INSTR_{k}" in system), None)
             if key is not None:
 
@@ -363,7 +428,13 @@ async def test_concurrency_semaphore_bounds_overlapping_delegations(tmp_path: Pa
             return gen2()
 
     provider = GatedProvider()
-    runtime = AgentRuntime(fleet=fleet, store=store, provider=provider, invariant_mode="strict")
+    runtime = AgentRuntime(
+        fleet=fleet,
+        store=store,
+        providers={"anthropic": provider},
+        default_provider="anthropic",
+        invariant_mode="strict",
+    )
     session = runtime.create_session("root")
 
     async def drain() -> AgentEndEvent:
@@ -414,7 +485,13 @@ async def test_child_context_isolation_sees_only_its_own_system_and_message(
             reply("root reply"),
         ]
     )
-    runtime = AgentRuntime(fleet=fleet, store=store, provider=provider, invariant_mode="strict")
+    runtime = AgentRuntime(
+        fleet=fleet,
+        store=store,
+        providers={"anthropic": provider},
+        default_provider="anthropic",
+        invariant_mode="strict",
+    )
     session = runtime.create_session("root")
 
     events = [event async for event in runtime.run_turn(session.session_id, "delegate please")]
@@ -463,7 +540,13 @@ async def test_cancellation_cascade_records_aborted_boundaries_in_both_sessions(
             reply(tool_calls=[ToolCall(id="c2", name="slow", arguments={})]),
         ]
     )
-    runtime = AgentRuntime(fleet=fleet, store=store, provider=provider, invariant_mode="strict")
+    runtime = AgentRuntime(
+        fleet=fleet,
+        store=store,
+        providers={"anthropic": provider},
+        default_provider="anthropic",
+        invariant_mode="strict",
+    )
     session = runtime.create_session("root")
 
     # `run_turn` doesn't hand back the harness, so `build_harness` is used
@@ -520,7 +603,13 @@ def test_build_harness_installs_the_invariant_hook_for_a_persisted_session(
 
     store = SessionStore(":memory:")
     provider = FakeProvider([reply("hi")])
-    runtime = AgentRuntime(fleet=fleet, store=store, provider=provider, invariant_mode="strict")
+    runtime = AgentRuntime(
+        fleet=fleet,
+        store=store,
+        providers={"anthropic": provider},
+        default_provider="anthropic",
+        invariant_mode="strict",
+    )
     session = runtime.create_session("root")
 
     harness = runtime.build_harness(session.session_id)
@@ -537,11 +626,71 @@ def test_build_harness_installs_no_hook_when_invariant_mode_is_off(tmp_path: Pat
 
     store = SessionStore(":memory:")
     provider = FakeProvider([reply("hi")])
-    runtime = AgentRuntime(fleet=fleet, store=store, provider=provider, invariant_mode="off")
+    runtime = AgentRuntime(
+        fleet=fleet,
+        store=store,
+        providers={"anthropic": provider},
+        default_provider="anthropic",
+        invariant_mode="off",
+    )
     session = runtime.create_session("root")
 
     harness = runtime.build_harness(session.session_id)
     assert harness.config.pre_request_hook is None
+    store.close()
+
+
+def test_build_harness_threads_model_max_tokens_and_thinking_budget(tmp_path: Path) -> None:
+    write_files(
+        tmp_path,
+        {
+            "agents/root/instructions.md": "you are root\n",
+            "agents/root/agent.yaml": (
+                "model:\n"
+                "  provider: anthropic\n"
+                "  name: claude-test\n"
+                "  max_tokens: 2048\n"
+                "  thinking_budget_tokens: 1024\n"
+            ),
+        },
+    )
+    fleet = compile_fleet(tmp_path)
+    assert fleet.agents["root"].ok is True
+
+    from knot.core.session.store import SessionStore
+
+    store = SessionStore(":memory:")
+    provider = FakeProvider([reply("hi")])
+    runtime = AgentRuntime(
+        fleet=fleet, store=store, providers={"anthropic": provider}, default_provider="anthropic"
+    )
+    session = runtime.create_session("root")
+
+    harness = runtime.build_harness(session.session_id)
+    assert harness.config.max_tokens == 2048
+    assert harness.config.thinking_budget_tokens == 1024
+    store.close()
+
+
+def test_build_harness_leaves_max_tokens_and_thinking_budget_none_without_model_block(
+    tmp_path: Path,
+) -> None:
+    write_files(tmp_path, {"agents/root/instructions.md": "you are root\n"})
+    fleet = compile_fleet(tmp_path)
+    assert fleet.agents["root"].ok is True
+
+    from knot.core.session.store import SessionStore
+
+    store = SessionStore(":memory:")
+    provider = FakeProvider([reply("hi")])
+    runtime = AgentRuntime(
+        fleet=fleet, store=store, providers={"anthropic": provider}, default_provider="anthropic"
+    )
+    session = runtime.create_session("root")
+
+    harness = runtime.build_harness(session.session_id)
+    assert harness.config.max_tokens is None
+    assert harness.config.thinking_budget_tokens is None
     store.close()
 
 
@@ -578,7 +727,13 @@ async def test_runtime_strict_mode_fails_run_before_provider_call_on_memory_only
 
     store = SessionStore(":memory:")
     provider = FakeProvider([reply("first turn done"), reply("should never be sent")])
-    runtime = AgentRuntime(fleet=fleet, store=store, provider=provider, invariant_mode="strict")
+    runtime = AgentRuntime(
+        fleet=fleet,
+        store=store,
+        providers={"anthropic": provider},
+        default_provider="anthropic",
+        invariant_mode="strict",
+    )
     session = runtime.create_session("root")
 
     # A normal, correctly-persisted first turn: baseline that the wiring
@@ -623,7 +778,13 @@ async def test_runtime_warn_mode_logs_divergence_and_continues_on_memory_only_ap
 
     store = SessionStore(":memory:")
     provider = FakeProvider([reply("first turn done"), reply("second turn done")])
-    runtime = AgentRuntime(fleet=fleet, store=store, provider=provider, invariant_mode="warn")
+    runtime = AgentRuntime(
+        fleet=fleet,
+        store=store,
+        providers={"anthropic": provider},
+        default_provider="anthropic",
+        invariant_mode="warn",
+    )
     session = runtime.create_session("root")
 
     events = [event async for event in runtime.run_turn(session.session_id, "hi")]
@@ -698,7 +859,13 @@ async def test_repeat_guard_advisory_survives_derive_state_at_the_same_position(
             reply("done"),
         ]
     )
-    runtime = AgentRuntime(fleet=fleet, store=store, provider=provider, invariant_mode="strict")
+    runtime = AgentRuntime(
+        fleet=fleet,
+        store=store,
+        providers={"anthropic": provider},
+        default_provider="anthropic",
+        invariant_mode="strict",
+    )
     session = runtime.create_session("root")
 
     harness = runtime.build_harness(session.session_id)
@@ -735,3 +902,325 @@ async def test_repeat_guard_advisory_survives_derive_state_at_the_same_position(
     assert [(m.role, m.text) for m in derived.messages] == [(m.role, m.text) for m in live_messages]
     assert derived_advisory_positions == live_advisory_positions
     store.close()
+
+
+# ---------------------------------------------------------------------------
+# Per-agent provider routing (design.md D2 / task 3.3): a session resolves
+# its provider from its OWN compiled agent's manifest, parent and delegated
+# child alike; an unresolvable ``model.provider`` fails at construction.
+# ---------------------------------------------------------------------------
+
+
+async def test_two_agents_on_different_providers_route_independently_in_one_runtime(
+    tmp_path: Path,
+) -> None:
+    write_files(
+        tmp_path,
+        {
+            "agents/alpha/instructions.md": "you are alpha\n",
+            "agents/alpha/agent.yaml": "model:\n  provider: anthropic\n  name: claude-x\n",
+            "agents/beta/instructions.md": "you are beta\n",
+            "agents/beta/agent.yaml": "model:\n  provider: litellm\n  name: gpt-x\n",
+        },
+    )
+    fleet = compile_fleet(tmp_path)
+    assert fleet.agents["alpha"].ok is True
+    assert fleet.agents["beta"].ok is True
+
+    from knot.core.session.store import SessionStore
+
+    store = SessionStore(":memory:")
+    anthropic_fake = FakeProvider([reply("alpha says hi")])
+    litellm_fake = FakeProvider([reply("beta says hi")])
+    runtime = AgentRuntime(
+        fleet=fleet,
+        store=store,
+        providers={"anthropic": anthropic_fake, "litellm": litellm_fake},
+        default_provider="anthropic",
+        invariant_mode="strict",
+    )
+
+    alpha_session = runtime.create_session("alpha")
+    [_ async for _ in runtime.run_turn(alpha_session.session_id, "hi")]
+    beta_session = runtime.create_session("beta")
+    [_ async for _ in runtime.run_turn(beta_session.session_id, "hi")]
+
+    # Each session's requests hit only its own agent's configured provider.
+    assert len(anthropic_fake.calls) == 1
+    assert anthropic_fake.session_ids == [alpha_session.session_id]
+    assert len(litellm_fake.calls) == 1
+    assert litellm_fake.session_ids == [beta_session.session_id]
+    store.close()
+
+
+async def test_delegated_child_uses_its_own_agents_provider_not_its_parents(
+    tmp_path: Path,
+) -> None:
+    write_files(
+        tmp_path,
+        {
+            "agents/root/instructions.md": "you are root\n",
+            "agents/root/subagents/researcher/instructions.md": "you research\n",
+            "agents/root/subagents/researcher/agent.yaml": (
+                "description: Digs up facts.\nmodel:\n  provider: litellm\n  name: some-model\n"
+            ),
+        },
+    )
+    fleet = compile_fleet(tmp_path)
+    assert fleet.agents["root"].ok is True
+
+    from knot.core.session.store import SessionStore
+
+    store = SessionStore(":memory:")
+    # root has no `model:` block at all, so it resolves to default_provider.
+    root_provider = FakeProvider(
+        [
+            reply(tool_calls=[ToolCall(id="c1", name="researcher", arguments={"message": "x"})]),
+            reply("root says: 42"),
+        ]
+    )
+    researcher_provider = FakeProvider([reply("the answer is 42")])
+    runtime = AgentRuntime(
+        fleet=fleet,
+        store=store,
+        providers={"anthropic": root_provider, "litellm": researcher_provider},
+        default_provider="anthropic",
+        invariant_mode="strict",
+    )
+    session = runtime.create_session("root")
+
+    events = [event async for event in runtime.run_turn(session.session_id, "research x")]
+    end = events[-1]
+    assert isinstance(end, AgentEndEvent)
+    assert end.outcome == "completed"
+
+    children = child_chain(store, session.session_id)
+    assert len(children) == 1
+    child_session_id = children[0].session.session_id
+
+    assert root_provider.session_ids == [session.session_id, session.session_id]
+    assert researcher_provider.session_ids == [child_session_id]
+    store.close()
+
+
+async def test_provider_less_fleet_reproduces_v0_behavior_with_just_the_default_entry(
+    tmp_path: Path,
+) -> None:
+    """Spec: "Backward compatibility for provider-less fleets" — a fleet in
+    which no agent sets ``model.provider`` needs nothing beyond a single
+    ``default_provider`` entry, exactly like v0's one shared provider."""
+    write_files(tmp_path, {"agents/root/instructions.md": "you are root\n"})
+    fleet = compile_fleet(tmp_path)
+    assert fleet.agents["root"].ok is True
+
+    from knot.core.session.store import SessionStore
+
+    store = SessionStore(":memory:")
+    provider = FakeProvider([reply("hi")])
+    runtime = AgentRuntime(
+        fleet=fleet,
+        store=store,
+        providers={"anthropic": provider},
+        default_provider="anthropic",
+        invariant_mode="strict",
+    )
+    session = runtime.create_session("root")
+
+    events = [event async for event in runtime.run_turn(session.session_id, "hi")]
+    end = events[-1]
+    assert isinstance(end, AgentEndEvent)
+    assert end.outcome == "completed"
+    assert provider.session_ids == [session.session_id]
+    store.close()
+
+
+def test_construction_raises_naming_the_agent_and_the_unresolvable_provider(
+    tmp_path: Path,
+) -> None:
+    write_files(
+        tmp_path,
+        {
+            "agents/root/instructions.md": "you are root\n",
+            "agents/root/agent.yaml": "model:\n  provider: litellm\n  name: some-model\n",
+        },
+    )
+    fleet = compile_fleet(tmp_path)
+    assert fleet.agents["root"].ok is True
+
+    from knot.core.session.store import SessionStore
+
+    store = SessionStore(":memory:")
+    provider = FakeProvider([])
+    with pytest.raises(ValueError, match="root") as exc_info:
+        AgentRuntime(
+            fleet=fleet,
+            store=store,
+            providers={"anthropic": provider},
+            default_provider="anthropic",
+        )
+    assert "litellm" in str(exc_info.value)
+    store.close()
+
+
+def test_construction_raises_when_default_provider_itself_is_unresolvable(
+    tmp_path: Path,
+) -> None:
+    write_files(tmp_path, {"agents/root/instructions.md": "you are root\n"})
+    fleet = compile_fleet(tmp_path)
+    assert fleet.agents["root"].ok is True
+
+    from knot.core.session.store import SessionStore
+
+    store = SessionStore(":memory:")
+    provider = FakeProvider([])
+    with pytest.raises(ValueError, match="anthropic"):
+        AgentRuntime(
+            fleet=fleet,
+            store=store,
+            providers={"litellm": provider},
+            default_provider="anthropic",
+        )
+    store.close()
+
+
+# ---------------------------------------------------------------------------
+# Session token budget (design.md D6 / task 6.3): the budget baseline is
+# summed from the session's durable entry log at harness-build time, so it
+# survives a process restart and is unaffected by compaction folding
+# entries out of the provider-visible projection.
+# ---------------------------------------------------------------------------
+
+
+def test_session_token_baseline_sums_raw_entries_even_after_compaction() -> None:
+    from knot.authoring.runtime import _session_token_baseline
+    from knot.core.session.entries import ENTRY_TYPE_COMPACTION, ENTRY_TYPE_MESSAGE, Compaction
+    from knot.core.session.store import SessionStore
+
+    with SessionStore(":memory:") as store:
+        session = store.create_session("agent_a")
+
+        user = UserMessage(content="hi")
+        store.append_entry(session.session_id, ENTRY_TYPE_MESSAGE, user.model_dump(by_alias=True))
+
+        first = AssistantMessage(usage=Usage(input=100, output=50))
+        first_entry = store.append_entry(
+            session.session_id, ENTRY_TYPE_MESSAGE, first.model_dump(by_alias=True)
+        )
+        second = AssistantMessage(usage=Usage(input=10, output=5))
+        store.append_entry(session.session_id, ENTRY_TYPE_MESSAGE, second.model_dump(by_alias=True))
+
+        # Compact away the user message and the first assistant reply: the
+        # provider-visible projection folds both behind a summary, but the
+        # underlying entries are never deleted or rewritten.
+        summary = AssistantMessage(content=[TextContent(text="summary")])
+        compaction = Compaction(covers_through_seq=first_entry.seq, summary_message=summary)
+        store.append_entry(
+            session.session_id, ENTRY_TYPE_COMPACTION, compaction.model_dump(by_alias=True)
+        )
+
+        projected = derive_state(store.entries(session.session_id))
+        assert not any(
+            isinstance(m, AssistantMessage) and m.usage.input == 100 for m in projected.messages
+        )
+
+        # The baseline is derived from the raw log, not the projection, so
+        # it still counts every persisted assistant message's usage.
+        assert _session_token_baseline(store, session.session_id) == 100 + 50 + 10 + 5
+
+
+def test_build_harness_threads_session_token_budget_and_zero_baseline_for_a_fresh_session(
+    tmp_path: Path,
+) -> None:
+    write_files(
+        tmp_path,
+        {
+            "agents/root/instructions.md": "you are root\n",
+            "agents/root/agent.yaml": "limits:\n  max_session_tokens: 50\n",
+        },
+    )
+    fleet = compile_fleet(tmp_path)
+    assert fleet.agents["root"].ok is True
+
+    from knot.core.session.store import SessionStore
+
+    store = SessionStore(":memory:")
+    provider = FakeProvider([reply("hi")])
+    runtime = AgentRuntime(
+        fleet=fleet, store=store, providers={"anthropic": provider}, default_provider="anthropic"
+    )
+    session = runtime.create_session("root")
+
+    harness = runtime.build_harness(session.session_id)
+    assert harness.config.max_session_tokens == 50
+    assert harness.config.session_tokens_baseline == 0
+    store.close()
+
+
+def test_build_harness_leaves_session_token_budget_unset_without_limits_block(
+    tmp_path: Path,
+) -> None:
+    write_files(tmp_path, {"agents/root/instructions.md": "you are root\n"})
+    fleet = compile_fleet(tmp_path)
+    assert fleet.agents["root"].ok is True
+
+    from knot.core.session.store import SessionStore
+
+    store = SessionStore(":memory:")
+    provider = FakeProvider([reply("hi")])
+    runtime = AgentRuntime(
+        fleet=fleet, store=store, providers={"anthropic": provider}, default_provider="anthropic"
+    )
+    session = runtime.create_session("root")
+
+    harness = runtime.build_harness(session.session_id)
+    assert harness.config.max_session_tokens is None
+    assert harness.config.session_tokens_baseline == 0
+    store.close()
+
+
+async def test_session_token_budget_baseline_survives_restart_and_ends_the_next_run(
+    tmp_path: Path,
+) -> None:
+    write_files(
+        tmp_path,
+        {
+            "agents/root/instructions.md": "you are root\n",
+            "agents/root/agent.yaml": "limits:\n  max_session_tokens: 50\n",
+        },
+    )
+    fleet = compile_fleet(tmp_path)
+    assert fleet.agents["root"].ok is True
+
+    from knot.core.session.store import SessionStore
+
+    db_path = tmp_path / "sessions.db"
+    store = SessionStore(db_path)
+    provider = FakeProvider([reply("hi", usage=Usage(input=40, output=20))])
+    runtime = AgentRuntime(
+        fleet=fleet, store=store, providers={"anthropic": provider}, default_provider="anthropic"
+    )
+    session = runtime.create_session("root")
+
+    events = [event async for event in runtime.run_turn(session.session_id, "go")]
+    end = events[-1]
+    assert isinstance(end, AgentEndEvent)
+    assert end.outcome == "completed"
+    store.close()
+
+    # Simulate a process restart: a fresh store connection over the same
+    # durable file, and a fresh AgentRuntime — nothing carried over in memory.
+    store2 = SessionStore(db_path)
+    provider2 = FakeProvider([reply("should never be reached")])
+    runtime2 = AgentRuntime(
+        fleet=fleet, store=store2, providers={"anthropic": provider2}, default_provider="anthropic"
+    )
+
+    harness2 = runtime2.build_harness(session.session_id)
+    assert harness2.config.session_tokens_baseline == 60  # 40 + 20, from the durable log
+
+    events2 = [event async for event in runtime2.run_turn(session.session_id, "again")]
+    end2 = events2[-1]
+    assert isinstance(end2, AgentEndEvent)
+    assert end2.outcome == "error"
+    assert len(provider2.calls) == 0  # the budget check happens before any request
+    store2.close()

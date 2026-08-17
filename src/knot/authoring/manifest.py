@@ -38,6 +38,12 @@ class ManifestTool(WireModel):
     input_schema: dict[str, JSONValue]
     source: str
     approval: ApprovalPolicyName = "never"
+    # TTL for this tool's approval park, in seconds (design D7); `None`
+    # (the default) means the request never expires on its own. Only ever
+    # non-null when the author configured the approvals object form
+    # (`{policy: ..., ttl_seconds: ...}`) — the bare-string form always
+    # resolves here to `None`.
+    ttl_seconds: int | None = None
     idempotent: bool = False
     executable: bool
 

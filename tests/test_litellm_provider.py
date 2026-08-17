@@ -246,3 +246,87 @@ async def test_provider_streams_tool_calls(monkeypatch: pytest.MonkeyPatch) -> N
     assert done.reason == "toolUse"
     assert done.message.tool_calls[0].name == "get_weather"
     assert done.message.tool_calls[0].arguments == {"city": "nyc"}
+
+
+async def test_per_call_max_tokens_reaches_completion_kwargs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured_kwargs: dict = {}
+
+    async def fake_acompletion(**kwargs):
+        captured_kwargs.update(kwargs)
+        return _FakeStream([{"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}])
+
+    _install_fake_litellm(monkeypatch, fake_acompletion)
+
+    provider = litellm_adapter.LiteLLMProvider(max_tokens=1024)
+    await _collect(
+        provider.stream_response(
+            model="gpt-4o-mini",
+            system="s",
+            messages=[UserMessage(content="hi")],
+            tools=[],
+            max_tokens=777,
+        )
+    )
+
+    assert captured_kwargs["max_tokens"] == 777
+
+
+class _CostChunk(dict):
+    """A dict-shaped fake chunk that also carries litellm's ``_hidden_params``
+    attribute, mirroring how litellm attaches per-response cost."""
+
+    def __init__(self, data: dict, hidden_params: dict | None = None) -> None:
+        super().__init__(data)
+        self._hidden_params = hidden_params or {}
+
+
+async def test_response_cost_is_passed_through_from_hidden_params(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def fake_acompletion(**kwargs):
+        return _FakeStream(
+            [
+                _CostChunk({"choices": [{"index": 0, "delta": {"content": "hi"}}]}),
+                _CostChunk(
+                    {"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]},
+                    hidden_params={"response_cost": 0.0042},
+                ),
+            ]
+        )
+
+    _install_fake_litellm(monkeypatch, fake_acompletion)
+
+    provider = litellm_adapter.LiteLLMProvider()
+    events = await _collect(
+        provider.stream_response(
+            model="gpt-4o-mini", system="s", messages=[UserMessage(content="hi")], tools=[]
+        )
+    )
+
+    done = events[-1]
+    assert isinstance(done, AssistantDoneEvent)
+    assert done.message.usage.cost is not None
+    assert done.message.usage.cost.total == 0.0042
+    assert done.message.usage.cost.input is None
+
+
+async def test_no_hidden_params_leaves_cost_none(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def fake_acompletion(**kwargs):
+        return _FakeStream(
+            [{"choices": [{"index": 0, "delta": {"content": "hi"}, "finish_reason": "stop"}]}]
+        )
+
+    _install_fake_litellm(monkeypatch, fake_acompletion)
+
+    provider = litellm_adapter.LiteLLMProvider()
+    events = await _collect(
+        provider.stream_response(
+            model="gpt-4o-mini", system="s", messages=[UserMessage(content="hi")], tools=[]
+        )
+    )
+
+    done = events[-1]
+    assert isinstance(done, AssistantDoneEvent)
+    assert done.message.usage.cost is None

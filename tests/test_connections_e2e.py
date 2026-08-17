@@ -80,7 +80,8 @@ async def test_agent_calls_connection_tool_through_the_real_pool(tmp_path: Path)
         runtime = AgentRuntime(
             fleet=fleet,
             store=store,
-            provider=provider,
+            providers={"anthropic": provider},
+            default_provider="anthropic",
             connection_pool=pool,
             invariant_mode="strict",
         )
@@ -125,7 +126,8 @@ async def test_unknown_connection_tool_is_rejected_with_no_network_attempt(tmp_p
         runtime = AgentRuntime(
             fleet=fleet,
             store=store,
-            provider=provider,
+            providers={"anthropic": provider},
+            default_provider="anthropic",
             connection_pool=pool,
             invariant_mode="strict",
         )
@@ -184,7 +186,8 @@ async def test_approval_gate_sees_only_model_arguments_then_executes_via_real_po
         runtime = AgentRuntime(
             fleet=fleet,
             store=store,
-            provider=provider,
+            providers={"anthropic": provider},
+            default_provider="anthropic",
             connection_pool=pool,
             provided_argument_resolver=resolver,
             invariant_mode="strict",
@@ -242,7 +245,8 @@ async def test_park_leaves_no_open_connection_in_the_pool(tmp_path: Path) -> Non
         runtime = AgentRuntime(
             fleet=fleet,
             store=store,
-            provider=provider,
+            providers={"anthropic": provider},
+            default_provider="anthropic",
             connection_pool=pool,
             invariant_mode="strict",
         )
@@ -276,7 +280,8 @@ async def test_oversized_connection_result_is_spilled_by_max_result_bytes(
         runtime = AgentRuntime(
             fleet=fleet,
             store=store,
-            provider=provider,
+            providers={"anthropic": provider},
+            default_provider="anthropic",
             connection_pool=pool,
             max_result_bytes=200,
             invariant_mode="strict",
@@ -324,7 +329,8 @@ async def test_no_secrets_reach_durable_storage_or_events(
         runtime = AgentRuntime(
             fleet=fleet,
             store=store,
-            provider=provider,
+            providers={"anthropic": provider},
+            default_provider="anthropic",
             connection_pool=pool,
             invariant_mode="strict",
         )

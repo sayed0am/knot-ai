@@ -32,12 +32,12 @@ def test_plain_text_turn_event_sequence_shape() -> None:
 
     events: list[AgentEvent] = [
         AgentStartEvent(),
-        TurnStartEvent(),
+        TurnStartEvent(turn=1),
         MessageStartEvent(message=user),
         MessageEndEvent(message=user),
         MessageStartEvent(message=assistant),
         MessageEndEvent(message=assistant),
-        TurnEndEvent(message=assistant),
+        TurnEndEvent(turn=1, message=assistant),
         AgentEndEvent(outcome="completed", messages=[user, assistant]),
     ]
 
@@ -84,6 +84,41 @@ def test_tool_execution_events_round_trip() -> None:
     for event in (start, update, end):
         restored = _ADAPTER.validate_json(event.model_dump_json(by_alias=True))
         assert restored == event
+
+
+def test_tool_execution_timestamps_are_ordered_and_subtractable() -> None:
+    """A start/end pair's timestamps yield a nonnegative duration without any
+    out-of-band data (event-timing-and-progress spec: "Latency derivable from
+    one stream")."""
+    start = ToolExecutionStartEvent(tool_call_id="c1", tool_name="get", args={})
+    end = ToolExecutionEndEvent(
+        tool_call_id="c1",
+        tool_name="get",
+        result=AgentToolResult(content=[TextContent(text="done")]),
+        is_error=False,
+    )
+
+    assert start.timestamp > 0
+    assert end.timestamp > 0
+    assert end.timestamp - start.timestamp >= 0
+
+
+def test_turn_events_serialize_camel_case_fields() -> None:
+    """`turn` and `timestamp` round-trip through the wire (camelCase) shape
+    without a rename — both are already flat lowercase identifiers."""
+    start = TurnStartEvent(turn=3)
+    payload = start.model_dump_json(by_alias=True)
+    assert '"turn":3' in payload
+    restored = _ADAPTER.validate_json(payload)
+    assert isinstance(restored, TurnStartEvent)
+    assert restored.turn == 3
+
+    tool_start = ToolExecutionStartEvent(tool_call_id="c1", tool_name="get", args={})
+    tool_payload = tool_start.model_dump_json(by_alias=True)
+    assert '"timestamp":' in tool_payload
+    restored_tool = _ADAPTER.validate_json(tool_payload)
+    assert isinstance(restored_tool, ToolExecutionStartEvent)
+    assert restored_tool.timestamp == tool_start.timestamp
 
 
 def test_agent_end_event_with_pending_requests_round_trips() -> None:

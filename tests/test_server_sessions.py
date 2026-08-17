@@ -6,9 +6,11 @@ import asyncio
 from pathlib import Path
 
 from authoring_fixtures import write_files
-from server_fixtures import client_for, live_server, make_app, parse_sse
+from server_fixtures import client_for, live_server, make_app, parse_sse, state_of
 
-from knot.providers.fake import reply, tool_call
+from knot.core.session.entries import ENTRY_TYPE_MESSAGE
+from knot.providers.fake import FakeProvider, reply, tool_call
+from knot.providers.messages import UserMessage
 
 
 def _gated_fleet(tmp_path: Path) -> None:
@@ -372,3 +374,148 @@ async def test_cancel_running_session_stops_it(tmp_path: Path) -> None:
         await asyncio.wait_for(task, timeout=5)
         final = await client.get(f"/sessions/{session_id}")
         assert final.json()["state"] == "idle"
+
+
+# -- steer (design D5) -------------------------------------------------------
+
+
+async def test_steer_mid_run_reaches_next_turn_and_is_durably_logged(tmp_path: Path) -> None:
+    write_files(
+        tmp_path,
+        {
+            "agents/root/instructions.md": "you are root\n",
+            "agents/root/tools/slow_tool.py": (
+                "import asyncio\n"
+                "from knot.authoring.tools import tool\n\n\n"
+                "@tool\n"
+                "async def slow_tool(x: str) -> str:\n"
+                '    """Slow."""\n'
+                "    await asyncio.sleep(0.3)\n"
+                "    return 'ok'\n"
+            ),
+        },
+    )
+    provider = FakeProvider([tool_call("slow_tool", {"x": "y"}), reply("done")])
+    app = make_app(tmp_path, [], provider=provider)
+
+    async with live_server(app) as client:
+        created = await client.post("/agents/root/sessions")
+        session_id = created.json()["sessionId"]
+
+        async with client.stream(
+            "POST", f"/sessions/{session_id}/messages", json={"text": "go"}
+        ) as resp:
+            buf = ""
+            async for chunk in resp.aiter_text():
+                buf += chunk
+                if "tool_execution_start" in buf:
+                    break
+
+            steer = await client.post(
+                f"/sessions/{session_id}/steer", json={"message": "also check the total"}
+            )
+            assert steer.status_code == 202
+            assert steer.json() == {"delivered": True}
+
+        for _ in range(50):
+            got = await client.get(f"/sessions/{session_id}")
+            if got.json()["state"] == "idle":
+                break
+            await asyncio.sleep(0.05)
+        else:
+            raise AssertionError("run never completed")
+
+    # The steered message reached the *next* turn's provider request...
+    assert len(provider.calls) == 2
+    second_call_messages = provider.calls[1][2]
+    assert any(
+        isinstance(m, UserMessage) and m.text == "also check the total"
+        for m in second_call_messages
+    )
+
+    # ...and is durably logged as an ordinary "message" entry, not a
+    # bespoke steering entry type (design D5: no new entry type).
+    state = state_of(app)
+    message_entries = [e for e in state.store.entries(session_id) if e.type == ENTRY_TYPE_MESSAGE]
+    assert any(
+        e.payload.get("role") == "user" and e.payload.get("content") == "also check the total"
+        for e in message_entries
+    )
+
+
+async def test_steer_idle_session_is_409_and_writes_nothing(tmp_path: Path) -> None:
+    write_files(tmp_path, {"agents/root/instructions.md": "hi\n"})
+    app = make_app(tmp_path, [reply("hello")])
+    async with client_for(app) as client:
+        created = await client.post("/agents/root/sessions")
+        session_id = created.json()["sessionId"]
+
+        resp = await client.post(f"/sessions/{session_id}/steer", json={"message": "hi"})
+        assert resp.status_code == 409
+        assert "/messages" in resp.json()["detail"]
+
+    state = state_of(app)
+    assert state.store.entries(session_id) == []
+
+
+async def test_steer_waiting_session_is_409(tmp_path: Path) -> None:
+    """A parked session has no run in progress either — steering only ever
+    targets an in-flight turn, not the merely-``waiting`` state that
+    ``/messages`` treats as queueable."""
+    _gated_fleet(tmp_path)
+    app = make_app(tmp_path, [tool_call("sensitive_op", {"amount": 5}), reply("done")])
+    async with client_for(app) as client:
+        created = await client.post("/agents/root/sessions")
+        session_id = created.json()["sessionId"]
+        await client.post(f"/sessions/{session_id}/messages", json={"text": "move 5"})
+
+        resp = await client.post(f"/sessions/{session_id}/steer", json={"message": "hi"})
+        assert resp.status_code == 409
+
+
+async def test_steer_unknown_session_is_404(tmp_path: Path) -> None:
+    write_files(tmp_path, {"agents/root/instructions.md": "hi\n"})
+    app = make_app(tmp_path, [])
+    async with client_for(app) as client:
+        resp = await client.post("/sessions/sess_nope/steer", json={"message": "hi"})
+        assert resp.status_code == 404
+
+
+async def test_steer_empty_message_is_422(tmp_path: Path) -> None:
+    write_files(tmp_path, {"agents/root/instructions.md": "hi\n"})
+    app = make_app(tmp_path, [reply("hello")])
+    async with client_for(app) as client:
+        created = await client.post("/agents/root/sessions")
+        session_id = created.json()["sessionId"]
+        resp = await client.post(f"/sessions/{session_id}/steer", json={"message": ""})
+        assert resp.status_code == 422
+
+
+async def test_steer_racing_run_completion_never_silently_drops(tmp_path: Path) -> None:
+    """A steer that lands after the run has already finished (registry
+    entry popped) 409s rather than vanishing — the endpoint's own
+    conflict path (no run in ``state.running``), exercised directly right
+    after a run completes rather than through an artificial timing race:
+    ``httpx.ASGITransport`` fully drains the stream before returning, so by
+    the time this request is made the run is guaranteed to be over, which
+    is exactly the "steer after completion" case design D5 documents as
+    409-or-delivered, never a silent drop."""
+    write_files(tmp_path, {"agents/root/instructions.md": "hi\n"})
+    app = make_app(tmp_path, [reply("hello")])
+    async with client_for(app) as client:
+        created = await client.post("/agents/root/sessions")
+        session_id = created.json()["sessionId"]
+
+        stream = await client.post(f"/sessions/{session_id}/messages", json={"text": "go"})
+        assert stream.status_code == 200
+        assert parse_sse(stream.text)[-1][1]["outcome"] == "completed"
+
+        resp = await client.post(f"/sessions/{session_id}/steer", json={"message": "too late"})
+        assert resp.status_code == 409
+
+    state = state_of(app)
+    assert not any(
+        e.payload.get("content") == "too late"
+        for e in state.store.entries(session_id)
+        if e.type == ENTRY_TYPE_MESSAGE
+    )

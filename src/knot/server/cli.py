@@ -15,16 +15,20 @@ import sys
 from collections.abc import Mapping
 from pathlib import Path
 
-from knot.authoring.compile import compile_fleet
+from knot.authoring.compile import CompiledAgent, CompiledFleet, compile_fleet
 from knot.authoring.connections import format_refresh_report, refresh_snapshots
 from knot.authoring.validate import format_report, run_validate
 from knot.core.invariant import InvariantMode
 from knot.core.session import SessionStore, export_session_jsonl
+from knot.providers.provider import ModelProvider
 from knot.server.app import create_app
 
 #: See ``resolve_invariant_mode``. Named for the setting it overrides, not
 #: for "knot" generically, since more env-overridable settings may follow.
 INVARIANT_MODE_ENV_VAR = "KNOT_INVARIANT_MODE"
+
+#: See ``resolve_serve_token`` (design.md D9).
+SERVE_TOKEN_ENV_VAR = "KNOT_SERVE_TOKEN"
 
 _INVARIANT_MODES: tuple[InvariantMode, ...] = ("strict", "warn", "off")
 
@@ -33,6 +37,98 @@ _INVARIANT_MODES: tuple[InvariantMode, ...] = ("strict", "warn", "off")
 #: explicitly instead of relying on this constant — it names only the
 #: ``knot serve`` default.
 DEFAULT_SERVING_INVARIANT_MODE: InvariantMode = "warn"
+
+#: Every provider name ``knot serve`` can construct — must match
+#: ``knot.authoring.config.ModelConfig.provider``'s ``Literal`` exactly
+#: (design.md D2: "the registry must cover exactly that set"). Keep the two
+#: in sync if either changes.
+SUPPORTED_PROVIDERS: tuple[str, ...] = ("anthropic", "openai", "openrouter", "litellm")
+
+#: The serving default (design.md D2): constructed unconditionally, even if
+#: no agent's manifest names it, matching the pre-D2 behavior of always
+#: starting one ``AnthropicProvider`` regardless of fleet content.
+DEFAULT_SERVING_PROVIDER = "anthropic"
+
+
+class ProviderStartupError(Exception):
+    """A compiled fleet names a provider ``knot serve`` cannot construct —
+    an unknown name or a failed construction (missing credentials, a
+    missing optional dependency, ...). Raised by ``build_provider_registry``
+    so ``_cmd_serve`` can report a diagnostic naming the agent(s) and
+    provider and exit non-zero, rather than failing at first request
+    (design.md D2's "Unknown provider rejected at startup")."""
+
+
+def _referenced_providers(fleet: CompiledFleet) -> dict[str, list[str]]:
+    """Every distinct ``model.provider`` value named by a successfully
+    compiled agent anywhere in ``fleet`` — top-level and every nested
+    subagent — mapped to the agent id(s) that name it, plus
+    ``DEFAULT_SERVING_PROVIDER`` (mapped to an empty list: it is
+    constructed unconditionally, not because some agent referenced it).
+    A failed (``ok=False``) agent has no manifest to read a provider off
+    of and is skipped, matching every other manifest-reading pass over a
+    fleet.
+    """
+    referenced: dict[str, list[str]] = {DEFAULT_SERVING_PROVIDER: []}
+
+    def walk(agents: Mapping[str, CompiledAgent]) -> None:
+        for compiled in agents.values():
+            if not compiled.ok:
+                continue
+            manifest = compiled.manifest
+            assert manifest is not None  # ok=True always has a manifest
+            if manifest.model is not None:
+                referenced.setdefault(manifest.model.provider, []).append(compiled.agent_id)
+            walk(compiled.subagents)
+
+    walk(fleet.agents)
+    return referenced
+
+
+def _construct_provider(name: str) -> ModelProvider:
+    """Build one named provider adapter from its own existing env-var
+    configuration convention (design.md D2). Imports are local so
+    constructing one provider never pulls in another's dependencies (in
+    particular, the optional ``litellm`` package stays uninstalled-safe
+    unless a fleet actually names ``litellm``).
+    """
+    if name == "anthropic":
+        from knot.providers.anthropic import AnthropicProvider  # noqa: PLC0415
+
+        return AnthropicProvider()
+    if name == "openai":
+        from knot.providers.openai_compatible import openai_provider  # noqa: PLC0415
+
+        return openai_provider()
+    if name == "openrouter":
+        from knot.providers.openai_compatible import openrouter_provider  # noqa: PLC0415
+
+        return openrouter_provider()
+    if name == "litellm":
+        from knot.providers.litellm import LiteLLMProvider  # noqa: PLC0415
+
+        return LiteLLMProvider()
+    raise ValueError(
+        f"unknown provider {name!r}: supported providers are {', '.join(SUPPORTED_PROVIDERS)}"
+    )
+
+
+def build_provider_registry(fleet: CompiledFleet) -> dict[str, ModelProvider]:
+    """Construct exactly the provider adapters ``fleet`` references (plus
+    the serving default), or raise ``ProviderStartupError`` naming the
+    offending agent(s) and provider — design.md D2's registry, built only
+    once at ``knot serve`` startup rather than per-request.
+    """
+    registry: dict[str, ModelProvider] = {}
+    for name, agent_ids in _referenced_providers(fleet).items():
+        try:
+            registry[name] = _construct_provider(name)
+        except Exception as exc:
+            agents = ", ".join(agent_ids) if agent_ids else "(serving default)"
+            raise ProviderStartupError(
+                f"agent(s) {agents}: could not start provider {name!r}: {exc}"
+            ) from exc
+    return registry
 
 
 def resolve_invariant_mode(
@@ -57,6 +153,23 @@ def resolve_invariant_mode(
             f"invalid {source} value {candidate!r}: must be one of {', '.join(_INVARIANT_MODES)}"
         )
     return candidate  # type: ignore[return-value]  # validated against _INVARIANT_MODES above
+
+
+def resolve_serve_token(
+    explicit: str | None, *, env: Mapping[str, str] | None = None
+) -> str | None:
+    """Resolve the effective bearer token for ``knot serve`` (design.md D9).
+
+    Precedence: an explicit value (the ``--token`` flag) wins outright over
+    ``$KNOT_SERVE_TOKEN``, which in turn wins over "no token" (``None``) —
+    the same precedence convention as ``resolve_invariant_mode``, minus that
+    function's "unknown value" validation: unlike an invariant mode, any
+    non-empty string is a valid token, so there is nothing to reject.
+    ``None`` means auth stays disabled — ``create_app``'s default, zero
+    behavior change from v0.
+    """
+    resolved_env = env if env is not None else os.environ
+    return explicit if explicit is not None else resolved_env.get(SERVE_TOKEN_ENV_VAR)
 
 
 def _cmd_export(args: argparse.Namespace) -> int:
@@ -114,20 +227,33 @@ def _cmd_serve(args: argparse.Namespace) -> int:
         print(f"knot: {exc}", file=sys.stderr)
         return 1
 
-    # v0.1 provider policy: 'serve' talks to every session, parent and
-    # descendant subagent alike, through one Anthropic provider instance
-    # (an agent's own manifest 'model.name' still selects which model that
-    # provider is asked for). Per-manifest provider choice (openai,
-    # openrouter, litellm, ...) is a later work package.
-    from knot.providers.anthropic import AnthropicProvider
+    # Per-agent provider routing (design.md D2): each session is served by
+    # the provider its own agent's manifest names (falling back to
+    # DEFAULT_SERVING_PROVIDER when unset) — an agent's manifest
+    # 'model.name' still selects which model that provider is asked for.
+    # Only the providers the fleet actually references (plus the serving
+    # default) are constructed, and construction failure — an unknown name
+    # or missing credentials — fails startup with a named diagnostic rather
+    # than the first request that needs it.
+    try:
+        providers = build_provider_registry(fleet)
+    except ProviderStartupError as exc:
+        print(f"knot: {exc}", file=sys.stderr)
+        return 1
+
+    # design.md D9: explicit --token wins over $KNOT_SERVE_TOKEN; neither
+    # present leaves auth disabled, exactly as before this flag existed.
+    # Never logged or echoed anywhere below — see create_app's own docstring.
+    auth_token = resolve_serve_token(args.token)
 
     store = SessionStore(args.db)
-    provider = AnthropicProvider()
     app = create_app(
         fleet=fleet,
         store=store,
-        provider=provider,
+        providers=providers,
+        default_provider=DEFAULT_SERVING_PROVIDER,
         runtime_kwargs={"invariant_mode": invariant_mode},
+        auth_token=auth_token,
     )
 
     import uvicorn
@@ -195,6 +321,14 @@ def build_parser() -> argparse.ArgumentParser:
             f"Defaults to ${INVARIANT_MODE_ENV_VAR} if set, else 'warn'."
         ),
     )
+    serve_parser.add_argument(
+        "--token",
+        default=None,
+        help=(
+            "Static bearer token required on every request (design D9). "
+            f"Defaults to ${SERVE_TOKEN_ENV_VAR} if set, else no auth is enforced."
+        ),
+    )
     serve_parser.set_defaults(handler=_cmd_serve)
 
     return parser
@@ -210,4 +344,13 @@ if __name__ == "__main__":
     raise SystemExit(main())
 
 
-__all__ = ["build_parser", "main", "resolve_invariant_mode"]
+__all__ = [
+    "DEFAULT_SERVING_PROVIDER",
+    "SUPPORTED_PROVIDERS",
+    "ProviderStartupError",
+    "build_parser",
+    "build_provider_registry",
+    "main",
+    "resolve_invariant_mode",
+    "resolve_serve_token",
+]

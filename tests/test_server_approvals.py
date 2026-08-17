@@ -59,6 +59,7 @@ async def test_approvals_lists_a_question_park_too(tmp_path: Path) -> None:
         assert rows[0]["kind"] == "question"
         assert rows[0]["toolName"] == "ask_user"
         assert rows[0]["payload"]["args"]["question"] == "which account?"
+        assert rows[0]["ttlSeconds"] is None
 
 
 async def test_approvals_never_lists_a_child_session_park(tmp_path: Path) -> None:
@@ -104,6 +105,40 @@ async def test_approvals_never_lists_a_child_session_park(tmp_path: Path) -> Non
         assert rows[0]["rootSessionId"] == session_id
         assert rows[0]["sessionId"] != session_id
         assert [hop["agentId"] for hop in rows[0]["path"]] == ["root", "researcher"]
+
+
+async def test_approvals_shows_ttl_seconds_from_the_object_form_and_null_for_the_bare_form(
+    tmp_path: Path,
+) -> None:
+    """Design D7: the object approvals form's ``ttl_seconds`` reaches the
+    pending request and is surfaced as ``ttlSeconds``; a bare-form-gated
+    tool (``ask_user``'s question park, from ``_gated_fleet``'s sibling
+    scenario above) shows ``null``, exactly as before D7."""
+    write_files(
+        tmp_path,
+        {
+            "agents/root/instructions.md": "you are root\n",
+            "agents/root/agent.yaml": (
+                "approvals:\n  sensitive_op:\n    policy: always\n    ttl_seconds: 3600\n"
+            ),
+            "agents/root/tools/sensitive_op.py": (
+                "from knot.authoring.tools import tool\n\n\n"
+                "@tool\n"
+                "def sensitive_op(amount: int) -> str:\n"
+                '    """Needs sign-off."""\n'
+                "    return f'moved {amount}'\n"
+            ),
+        },
+    )
+    app = make_app(tmp_path, [tool_call("sensitive_op", {"amount": 1}), reply("done")])
+    async with client_for(app) as client:
+        created = await client.post("/agents/root/sessions")
+        session_id = created.json()["sessionId"]
+        await client.post(f"/sessions/{session_id}/messages", json={"text": "go"})
+
+        rows = (await client.get("/approvals?status=pending")).json()
+        assert len(rows) == 1
+        assert rows[0]["ttlSeconds"] == 3600
 
 
 async def test_approvals_resolves_and_disappears_from_the_inbox(tmp_path: Path) -> None:

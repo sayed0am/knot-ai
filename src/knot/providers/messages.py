@@ -41,13 +41,18 @@ class WireModel(BaseModel):
 
 
 class UsageCost(WireModel):
-    """Billed response cost in USD."""
+    """Billed response cost in USD.
 
-    input: float = 0.0
-    output: float = 0.0
-    cache_read: float = 0.0
-    cache_write: float = 0.0
-    total: float = 0.0
+    Category fields are ``None`` when a provider reports only a total (see
+    design D3): they are never fabricated as zero to stand in for unknown.
+    ``total`` is required whenever a ``UsageCost`` exists at all.
+    """
+
+    input: float | None = None
+    output: float | None = None
+    cache_read: float | None = None
+    cache_write: float | None = None
+    total: float
 
 
 class Usage(WireModel):
@@ -60,7 +65,9 @@ class Usage(WireModel):
     cache_write_1h: int | None = None
     reasoning: int | None = None
     total_tokens: int = 0
-    cost: UsageCost = UsageCost()
+    # `None` unless the provider actually reported a cost (design D3) — no
+    # adapter is allowed to fabricate an all-zeros stand-in for "unknown".
+    cost: UsageCost | None = None
 
 
 class TextContent(WireModel):

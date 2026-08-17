@@ -50,15 +50,20 @@ model:
   name: claude-3-5-haiku-20241022
   max_tokens: 1024
   context_window: 200000
+  thinking_budget_tokens: null
 limits:
   max_turns: 12
   max_result_bytes: null
+  max_session_tokens: null
   delegation_max_per_turn: 2
   delegation_max_concurrent: 1
 use:
   - crm
 approvals:
   update_customer: always
+  refund_customer:
+    policy: always
+    ttl_seconds: 3600
 compaction:
   enabled: true
   threshold_ratio: 0.8
@@ -75,22 +80,24 @@ repeat_guard:
 | Field | Type | Default | Meaning |
 |---|---|---|---|
 | `description` | `str \| null` | `null` | For a top-level agent, shown by `GET /agents`. For a **subagent**, this is required (see below) and becomes the description of the delegation tool the parent model sees. |
-| `model.provider` | `"anthropic" \| "openai" \| "openrouter" \| "litellm"` | — (required if `model:` is present) | Which provider family this agent's model belongs to. In v0, `knot serve` talks to every session through one shared provider instance regardless of this field — it is informational/forward-looking, not yet a per-agent provider switch. |
+| `model.provider` | `"anthropic" \| "openai" \| "openrouter" \| "litellm"` | — (required if `model:` is present) | Which provider serves this agent's sessions — `knot serve` routes each session's model requests to the named provider, parent and delegated child sessions alike (a child always uses its own agent's configured provider, never its parent's — never inherited). If this agent's manifest omits the whole `model:` block, its sessions use the serving default provider instead (see below). `knot serve` constructs exactly the providers referenced anywhere in the fleet, plus the serving default, at startup — a provider name it cannot construct (unknown name, or a construction failure such as missing credentials) fails startup with a diagnostic naming the agent and provider, rather than failing at the first request. |
 | `model.name` | `str` | — (required if `model:` is present) | The model name/id passed to the provider. |
-| `model.max_tokens` | `int \| null` | `null` | Passed through to the provider on every call. |
+| `model.max_tokens` | `int \| null` | `null` | Passed through to the provider as the response-token ceiling on every call. |
 | `model.context_window` | `int \| null` | `null` | The model's context window, in tokens — see [Context compaction](#context-compaction) below. Must be a positive integer if set. `null` doesn't disable compaction outright: knot falls back to a small built-in table of well-known model names (`knot.providers.capacity`); only an unmapped model name with no explicit override leaves capacity — and therefore the *proactive* trigger — unknown. |
+| `model.thinking_budget_tokens` | `int \| null` | `null` | Enables extended thinking with this token budget on every call, for providers that support it. Today only `model.provider: anthropic` can honor it — setting it alongside any other provider is a compile error, not a silent no-op. |
 | `limits.max_turns` | `int \| null` | `null` (unlimited) | Maximum number of assistant turns before the run stops. |
 | `limits.max_result_bytes` | `int \| null` | `null` | Caps a tool result's serialized size; an oversized result is spilled — replaced with a bounded preview plus a retrieval notice — with truncation as the fallback. See [Oversized tool results (spill)](#oversized-tool-results-spill) below. |
+| `limits.max_session_tokens` | `int \| null` | `null` (unlimited) | Maximum total token budget for the session: the sum of provider-reported input, output, and cache (read + write) tokens across *every* run of the session, derived from the durable entry log — so it survives a process restart and is unaffected by context compaction folding old messages behind a summary. Checked before each model request; once accumulated usage meets or exceeds the budget, the run ends with an error outcome naming the budget and the amount consumed, and no further provider request is made. Must be a positive integer if set. |
 | `limits.delegation_max_per_turn` | `int` | `4` | How many delegation (subagent) calls this agent may make in a single turn; exceeding it fails the delegation call with an error instead of running it. |
 | `limits.delegation_max_concurrent` | `int` | `2` | How many delegation calls may be in flight at once, enforced by a semaphore. |
 | `use` | `list[str]` | `[]` | Bundle ids (directory names under `shared/`) whose tools, skills, and approvals this agent pulls in. See [`docs/bundles.md`](bundles.md). |
-| `approvals` | `dict[str, "never"\|"once"\|"always"]` | `{}` | Per-tool approval policy overrides. **Agent-level approvals always win over a bundle's** — see [`docs/bundles.md`](bundles.md) for the full vocabulary and suffix-matching rule. |
+| `approvals` | `dict[str, "never"\|"once"\|"always" \| {policy, ttl_seconds}]` | `{}` | Per-tool approval policy overrides. Each entry is either the bare policy name shown above, or an object naming the policy plus an optional `ttl_seconds` (a positive integer) — see [Approval TTLs](#approval-ttls) below. **Agent-level approvals always win over a bundle's** — see [`docs/bundles.md`](bundles.md) for the full vocabulary and suffix-matching rule. |
 | `compaction.*` | — | enabled, defaults below | Context compaction settings — see [Context compaction](#context-compaction) below for the full field list and validation rules. |
 | `repeat_guard.*` | — | enabled, defaults below | Repeat-tool-call guard settings — see [Repeat-tool-call guard](#repeat-tool-call-guard) below for the full field list, exclusion semantics, and validation rules. |
 
 If `model:` is omitted entirely, the session runs with the runtime's
 `default_model` (a fallback the server operator configures, not part of
-`agent.yaml`).
+`agent.yaml`) and its serving default provider (see `model.provider` above).
 
 ## The `@tool` decorator
 
@@ -218,6 +225,31 @@ own `@tool` as exempt from spilling. `spill_exempt` exists as an internal
 `AgentTool` field (set on `read_tool_output` itself, to prevent the
 spill-retrieve loop above), but it is not a parameter the `@tool` decorator
 accepts — an authored tool's results are always eligible for spilling.
+
+## Approval TTLs
+
+Each entry in `approvals` may be the bare policy name (`never`/`once`/`always`,
+unchanged from before) or an object form that adds a TTL:
+
+```yaml
+approvals:
+  update_customer: always              # bare form: never expires
+  refund_customer:
+    policy: always
+    ttl_seconds: 3600                  # object form: expires after an hour
+```
+
+`ttl_seconds` (a positive integer, seconds) is carried onto every pending
+approval request that tool's policy parks. The expiry mechanism itself isn't
+new — knot already lazily sweeps overdue pending requests — this just makes
+it reachable from configuration instead of a custom decision hook. If a
+`ttl_seconds`-bearing request is still unresolved once its TTL elapses, it is
+durably denied with an expiry reason fed back to the model as the tool's
+result, exactly as if a human had denied it; a response that arrives after
+expiry is rejected, never silently applied. A bare-form entry (or an object
+form with `ttl_seconds` omitted) never expires on its own, matching today's
+behavior. The fleet-wide `GET /approvals` inbox reports each pending
+request's configured TTL alongside its age — see [`docs/http-api.md`](http-api.md).
 
 ## Context compaction
 
@@ -466,6 +498,124 @@ and even its own nested `subagents/`. See
 - Identity is scoped to the parent: a subagent id only has to be unique
   within its own parent, not fleet-wide, since two different agents may
   each have their own, unrelated `researcher` subagent.
+
+## Authoring recipes: typed verdicts and context-threading
+
+Two recipes for a common shape of multi-agent design: a critic/judge
+subagent that needs to report a structured outcome, and a producer/critic
+loop that needs more than one round.
+
+### Typed verdicts: structured critic/judge outcomes
+
+When an author needs a structured outcome from a critic/judge/reviewer
+agent — "approve vs. revise, with reasons", say — the knot-native pattern
+is the same `@tool` mechanism described [above](#the-tool-decorator): a
+tool whose typed `Annotated` args *are* the schema, which the critic must
+call to report its verdict.
+
+```python
+from typing import Annotated, Literal
+from knot.authoring.tools import tool
+
+@tool
+def submit_verdict(
+    decision: Annotated[Literal["approve", "revise"], "Whether the draft is ready to ship."],
+    reasons: Annotated[str, "Why — enough detail for the parent to act on a 'revise' verdict."],
+) -> str:
+    """Record this review's verdict.
+
+    Call this exactly once, as your last action — do not describe the
+    verdict in prose instead.
+    """
+    return f"Verdict recorded: {decision}"
+```
+
+A critic subagent's `instructions.md` tells it to call `submit_verdict`
+exactly once, as its final action, rather than describing its verdict in
+free text. Because the call is validated against the tool's pydantic-derived
+schema before it's even accepted, the resulting tool-call entry — `decision`
+and `reasons` as typed, already-valid fields — is itself the machine-readable
+verdict: visible in the transcript like any other durable entry (see
+[The entry log keeps everything](#the-entry-log-keeps-everything)), and
+directly parseable by whatever reads the child's session afterward, with no
+separate encoding step.
+
+Contrast this with the fragile alternative: a magic string buried in free
+text, e.g. checking whether the child's answer contains the literal
+substring `"CODE_IS_PERFECT"`. That approach is brittle exactly where the
+tool form is solid — a model can phrase its answer differently, misspell or
+punctuate around the magic string, or produce prose that happens to
+*contain* it in a negated sentence ("this is **not** CODE_IS_PERFECT"), and
+every one of those is a silent misparse rather than a validation error. The
+tool form has no parsing step to get wrong: the schema is enforced up front
+by the same mechanism as any other `@tool`, the result is durably logged
+the moment the call is made, and there is nothing for a caller to
+re-extract from prose.
+
+### Context-threading: the recipe for multi-round loops
+
+Delegation in knot is deliberately memoryless: as [Subagents](#subagents)
+above describes, every delegation call creates a brand-new child session
+and is a pure function of its single `{message}` string — a child holds no
+state between calls, and there is no way to resume a *finished* child with
+more input.
+
+This is a design decision, not a missing feature. Multi-round patterns —
+producer/critic, generator/judge, draft/revise — are expressed by the
+**parent** threading context explicitly: each new `{message}` includes
+whatever prior state the next round actually needs (the prior draft, the
+prior verdict, and so on). Two things fall out of this that a hidden-memory
+child wouldn't give you for free:
+
+- **Every delegation call's args are the child's full input, in the log.**
+  Because nothing is implicit, reading a single tool-call entry for a
+  delegation tells you exactly what that child session knew when it ran —
+  no need to reconstruct state from a chain of prior calls to understand
+  any one of them.
+- **Prompt caching absorbs most of the cost of re-sending context.** Each
+  round's `{message}` repeats content from earlier rounds verbatim (the
+  same draft text, the same brief), which is exactly the shape a provider's
+  prompt cache is good at — the token *cost* of re-threading context is
+  much smaller than its size on the wire suggests.
+
+A compact worked example — instructions to a parent agent running a
+draft → critique → revise loop against a `writer` subagent and a `critic`
+subagent (the one built around `submit_verdict` above):
+
+```
+Round 1 — draft:
+  Delegate to `writer` with message:
+    "Write a 200-word product description for <product>.
+     Constraints: <...>."
+  → holds draft_v1.
+
+Round 2 — critique:
+  Delegate to `critic` with message:
+    "Review this draft against the brief below and call submit_verdict.
+
+     Brief: <...>
+
+     Draft:
+     <draft_v1>"
+  → holds verdict.decision, verdict.reasons.
+
+Round 3 — revise (only if verdict.decision == "revise"):
+  Delegate to `writer` with message:
+    "Revise this draft to address the feedback below.
+
+     Original brief: <...>
+
+     Previous draft:
+     <draft_v1>
+
+     Reviewer feedback:
+     <verdict.reasons>"
+  → holds draft_v2.
+```
+
+Each round's message is self-contained: the child never needs to have
+"remembered" anything from a prior round, because the parent hands it
+everything it needs, every time.
 
 ## Validating a fleet
 

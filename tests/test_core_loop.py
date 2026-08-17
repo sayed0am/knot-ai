@@ -11,6 +11,9 @@ from knot.core.events import (
     MessageEndEvent,
     PendingInputRequest,
     ToolExecutionEndEvent,
+    ToolExecutionStartEvent,
+    TurnEndEvent,
+    TurnStartEvent,
 )
 from knot.core.invariant import DivergenceReport, HistoryDivergenceError
 from knot.core.loop import run_agent_loop
@@ -18,7 +21,13 @@ from knot.core.repeat_guard import ADVISORY_TAG_OPEN, RepeatGuardSettings
 from knot.core.tool_history import repair_tool_history
 from knot.core.tools import AgentTool, AgentToolResult, ToolParkedError
 from knot.providers.fake import FakeProvider, error, reply, tool_call
-from knot.providers.messages import AssistantMessage, ToolCall, ToolResultMessage, UserMessage
+from knot.providers.messages import (
+    AssistantMessage,
+    ToolCall,
+    ToolResultMessage,
+    Usage,
+    UserMessage,
+)
 from knot.providers.provider import SimpleCancellationToken
 
 
@@ -27,6 +36,42 @@ def _echo_tool(name: str) -> AgentTool:
         return AgentToolResult(content=f"{name}-result")
 
     return AgentTool(name=name, description="", parameters={}, execute_fn=run)
+
+
+class _KwargsCapturingProvider:
+    """Records every ``stream_response`` call's per-call request kwargs.
+
+    ``FakeProvider.calls`` is a fixed 4-tuple shared by many other tests, so
+    it never grew ``max_tokens``/``thinking_budget_tokens`` fields; this
+    stub exists just to observe those two without touching that shape.
+    """
+
+    def __init__(self, scripts) -> None:
+        self._scripts = list(scripts)
+        self.max_tokens_calls: list[int | None] = []
+        self.thinking_budget_calls: list[int | None] = []
+
+    def stream_response(
+        self,
+        *,
+        model,
+        system,
+        messages,
+        tools,
+        signal=None,
+        session_id=None,
+        max_tokens=None,
+        thinking_budget_tokens=None,
+    ):
+        self.max_tokens_calls.append(max_tokens)
+        self.thinking_budget_calls.append(thinking_budget_tokens)
+        script = self._scripts.pop(0) if self._scripts else []
+
+        async def iterator():
+            for event in script:
+                yield event
+
+        return iterator()
 
 
 async def _collect(**kwargs) -> list[AgentEvent]:
@@ -94,6 +139,12 @@ async def test_tool_call_then_second_provider_call_completes() -> None:
     second_call_messages = provider.calls[1][2]
     assert any(isinstance(m, ToolResultMessage) for m in second_call_messages)
 
+    # Turn numbers are 1-based and increment across this two-turn run.
+    turn_starts = [e for e in events if isinstance(e, TurnStartEvent)]
+    turn_ends = [e for e in events if isinstance(e, TurnEndEvent)]
+    assert [e.turn for e in turn_starts] == [1, 2]
+    assert [e.turn for e in turn_ends] == [1, 2]
+
 
 async def test_three_tool_calls_execute_concurrently() -> None:
     ready = {name: asyncio.Event() for name in ("a", "b", "c")}
@@ -130,6 +181,13 @@ async def test_three_tool_calls_execute_concurrently() -> None:
     ends = [e for e in events if isinstance(e, ToolExecutionEndEvent)]
     assert {e.tool_call_id for e in ends} == {"call_a", "call_b", "call_c"}
     assert all(not e.is_error for e in ends)
+
+    # Each call's start/end timestamps are ordered and subtractable, with no
+    # out-of-band data needed to derive its duration.
+    starts_by_id = {e.tool_call_id: e for e in events if isinstance(e, ToolExecutionStartEvent)}
+    for end in ends:
+        start = starts_by_id[end.tool_call_id]
+        assert end.timestamp - start.timestamp >= 0
 
 
 async def test_mixed_park_two_execute_one_waits_for_approval() -> None:
@@ -440,6 +498,80 @@ async def test_max_turns_below_one_ends_immediately_with_error() -> None:
     assert isinstance(end, AgentEndEvent)
     assert end.outcome == "error"
     assert len(provider.calls) == 0
+
+
+async def test_session_token_budget_exhausted_ends_run_before_next_provider_call() -> None:
+    call = ToolCall(id="c1", name="get_invoice", arguments={})
+    provider = FakeProvider(
+        [
+            reply(tool_calls=[call], usage=Usage(input=40, output=20)),
+            reply("should never be reached"),
+        ]
+    )
+    tool = _echo_tool("get_invoice")
+
+    events = await _collect(
+        provider=provider,
+        model="m",
+        system="s",
+        messages=[],
+        tools=[tool],
+        prompts=[UserMessage(content="go")],
+        max_session_tokens=50,
+    )
+
+    end = events[-1]
+    assert isinstance(end, AgentEndEvent)
+    assert end.outcome == "error"
+    # The first turn's usage (60) already met the budget, so the second
+    # provider request (the one following the tool call) is never made.
+    assert len(provider.calls) == 1
+    assert any(
+        isinstance(e, MessageEndEvent)
+        and isinstance(e.message, AssistantMessage)
+        and e.message.stop_reason == "error"
+        and "session token budget" in (e.message.error_message or "")
+        and "max_session_tokens=50" in (e.message.error_message or "")
+        for e in events
+    )
+
+
+async def test_session_token_budget_counts_the_baseline_before_any_request() -> None:
+    provider = FakeProvider([reply("should never be reached")])
+
+    events = await _collect(
+        provider=provider,
+        model="m",
+        system="s",
+        messages=[],
+        tools=[],
+        prompts=[UserMessage(content="go")],
+        max_session_tokens=50,
+        session_tokens_baseline=50,
+    )
+
+    end = events[-1]
+    assert isinstance(end, AgentEndEvent)
+    assert end.outcome == "error"
+    assert len(provider.calls) == 0
+
+
+async def test_unset_session_token_budget_never_checks() -> None:
+    provider = FakeProvider([reply("hello there")])
+
+    events = await _collect(
+        provider=provider,
+        model="m",
+        system="s",
+        messages=[],
+        tools=[],
+        prompts=[UserMessage(content="go")],
+        session_tokens_baseline=10_000_000,  # would blow any real budget
+    )
+
+    end = events[-1]
+    assert isinstance(end, AgentEndEvent)
+    assert end.outcome == "completed"
 
 
 async def test_provider_error_ends_run_with_error_outcome() -> None:
@@ -891,6 +1023,40 @@ async def test_repeat_guard_disabled_never_fires() -> None:
     )
 
     assert _advisory_messages(events) == []
+
+
+async def test_max_tokens_and_thinking_budget_reach_every_provider_call() -> None:
+    provider = _KwargsCapturingProvider([reply("hi")])
+
+    await _collect(
+        provider=provider,
+        model="m",
+        system="s",
+        messages=[],
+        tools=[],
+        prompts=[UserMessage(content="go")],
+        max_tokens=512,
+        thinking_budget_tokens=256,
+    )
+
+    assert provider.max_tokens_calls == [512]
+    assert provider.thinking_budget_calls == [256]
+
+
+async def test_unset_max_tokens_and_thinking_budget_pass_through_as_none() -> None:
+    provider = _KwargsCapturingProvider([reply("hi")])
+
+    await _collect(
+        provider=provider,
+        model="m",
+        system="s",
+        messages=[],
+        tools=[],
+        prompts=[UserMessage(content="go")],
+    )
+
+    assert provider.max_tokens_calls == [None]
+    assert provider.thinking_budget_calls == [None]
 
 
 async def test_repeat_guard_default_none_never_fires() -> None:

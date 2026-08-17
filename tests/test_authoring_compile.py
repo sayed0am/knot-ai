@@ -290,6 +290,47 @@ def test_agent_approval_overrides_bundle_approval_for_same_tool(tmp_path: Path) 
     assert shared_tool.approval == "never"
 
 
+def test_approval_object_form_carries_ttl_into_the_manifest(tmp_path: Path) -> None:
+    """Design D7: the object form (``{policy, ttl_seconds}``) resolves to
+    the same ``approval`` policy as the bare form, plus a ``ttl_seconds``
+    the bare form never sets."""
+    write_files(
+        tmp_path,
+        {
+            "agents/helper/instructions.md": "hi\n",
+            "agents/helper/agent.yaml": (
+                "approvals:\n  shared_tool:\n    policy: always\n    ttl_seconds: 3600\n"
+            ),
+            "agents/helper/tools/shared_tool.py": _TOOL_SRC.format(name="shared_tool"),
+        },
+    )
+
+    fleet = compile_fleet(tmp_path)
+    manifest = fleet.agents["helper"].manifest
+    assert manifest is not None
+    shared_tool = next(t for t in manifest.tools if t.name == "shared_tool")
+    assert shared_tool.approval == "always"
+    assert shared_tool.ttl_seconds == 3600
+
+
+def test_approval_bare_form_leaves_ttl_seconds_none(tmp_path: Path) -> None:
+    write_files(
+        tmp_path,
+        {
+            "agents/helper/instructions.md": "hi\n",
+            "agents/helper/agent.yaml": "approvals:\n  shared_tool: always\n",
+            "agents/helper/tools/shared_tool.py": _TOOL_SRC.format(name="shared_tool"),
+        },
+    )
+
+    fleet = compile_fleet(tmp_path)
+    manifest = fleet.agents["helper"].manifest
+    assert manifest is not None
+    shared_tool = next(t for t in manifest.tools if t.name == "shared_tool")
+    assert shared_tool.approval == "always"
+    assert shared_tool.ttl_seconds is None
+
+
 def test_approval_for_unknown_tool_is_a_warning(tmp_path: Path) -> None:
     write_files(
         tmp_path,
@@ -536,3 +577,44 @@ def test_nested_subagent_of_subagent_compiles(tmp_path: Path) -> None:
     assert researcher.manifest.subagent_ids == ["fact_checker"]
     assert any(t.name == "fact_checker" for t in researcher.manifest.tools)
     assert "fact_checker" in researcher.subagents
+
+
+def test_thinking_budget_on_anthropic_provider_compiles(tmp_path: Path) -> None:
+    write_files(
+        tmp_path,
+        {
+            "agents/helper/instructions.md": "hi\n",
+            "agents/helper/agent.yaml": (
+                "model:\n"
+                "  provider: anthropic\n"
+                "  name: claude-test\n"
+                "  thinking_budget_tokens: 2048\n"
+            ),
+        },
+    )
+
+    fleet = compile_fleet(tmp_path)
+    compiled = fleet.agents["helper"]
+    assert compiled.ok is True
+    assert compiled.manifest is not None
+    assert compiled.manifest.model is not None
+    assert compiled.manifest.model.thinking_budget_tokens == 2048
+
+
+def test_thinking_budget_on_non_anthropic_provider_is_a_compile_error(tmp_path: Path) -> None:
+    write_files(
+        tmp_path,
+        {
+            "agents/helper/instructions.md": "hi\n",
+            "agents/helper/agent.yaml": (
+                "model:\n  provider: openai\n  name: gpt-test\n  thinking_budget_tokens: 2048\n"
+            ),
+        },
+    )
+
+    fleet = compile_fleet(tmp_path)
+    compiled = fleet.agents["helper"]
+    assert compiled.ok is False
+    diagnostic = next(d for d in compiled.diagnostics if "thinking_budget_tokens" in d.message)
+    assert diagnostic.severity == "error"
+    assert "openai" in diagnostic.message

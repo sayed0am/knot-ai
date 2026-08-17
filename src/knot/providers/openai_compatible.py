@@ -109,11 +109,24 @@ class OpenAICompatibleProvider:
         tools: Sequence[ToolSpec],
         signal: CancellationToken | None = None,
         session_id: str | None = None,
+        max_tokens: int | None = None,
+        thinking_budget_tokens: int | None = None,
     ) -> AsyncIterator[AssistantMessageEvent]:
-        """Stream one response as assistant message events."""
-        del session_id
+        """Stream one response as assistant message events.
+
+        ``thinking_budget_tokens`` is accepted for protocol conformance but
+        has no chat-completions equivalent this adapter can honor, so it is
+        ignored — the compile-time diagnostic in ``knot.authoring.compile``
+        is what stops it from being set here silently.
+        """
+        del session_id, thinking_budget_tokens
         raw = self._stream_provider_events(
-            model=model, system=system, messages=messages, tools=tools, signal=signal
+            model=model,
+            system=system,
+            messages=messages,
+            tools=tools,
+            signal=signal,
+            max_tokens=max_tokens,
         )
         return canonicalize_provider_stream(
             raw, api="openai-completions", provider=self._provider_name, model=model
@@ -127,6 +140,7 @@ class OpenAICompatibleProvider:
         messages: Sequence[AgentMessage],
         tools: Sequence[ToolSpec],
         signal: CancellationToken | None = None,
+        max_tokens: int | None = None,
     ) -> AsyncIterator[ProviderEvent]:
         async def iterator() -> AsyncIterator[ProviderEvent]:
             if signal is not None and signal.is_cancelled():
@@ -139,7 +153,7 @@ class OpenAICompatibleProvider:
                 system=system,
                 messages=messages,
                 tools=tools,
-                max_tokens=self._max_tokens,
+                max_tokens=max_tokens if max_tokens is not None else self._max_tokens,
                 reasoning_effort=self._reasoning_effort,
             )
             headers = {

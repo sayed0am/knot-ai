@@ -27,6 +27,7 @@ from pathlib import Path
 from knot.authoring.config import (
     AgentConfig,
     ApprovalPolicyName,
+    ApprovalSetting,
     ConnectionConfig,
     load_agent_config,
     load_bundle_config,
@@ -47,9 +48,22 @@ from knot.core.spill_tool import build_read_tool_output_placeholder
 from knot.core.tools import AgentTool
 
 
-def _resolve_approval(
-    approvals: dict[str, ApprovalPolicyName], tool_name: str
-) -> ApprovalPolicyName:
+def _normalize_approvals(
+    raw: dict[str, ApprovalPolicyName | ApprovalSetting],
+) -> dict[str, ApprovalSetting]:
+    """Normalize the bare-string and object forms of one ``approvals`` map
+    into a uniform ``ApprovalSetting`` object (design D7), so every
+    downstream consumer (bundle merge, ``_resolve_approval``, the manifest)
+    handles one shape. A bare string normalizes to ``ttl_seconds=None`` —
+    exactly the pre-D7 behavior.
+    """
+    return {
+        name: value if isinstance(value, ApprovalSetting) else ApprovalSetting(policy=value)
+        for name, value in raw.items()
+    }
+
+
+def _resolve_approval(approvals: dict[str, ApprovalSetting], tool_name: str) -> ApprovalSetting:
     """Exact key first, then longest matching ``__``-qualified suffix key.
 
     Mirrors ``knot.core.hitl.policies._resolve_policy``'s matching rule so a
@@ -66,7 +80,7 @@ def _resolve_approval(
         suffix = f"__{key}"
         if tool_name.endswith(suffix) and (best_key is None or len(key) > len(best_key)):
             best_key = key
-    return approvals[best_key] if best_key is not None else "never"
+    return approvals[best_key] if best_key is not None else ApprovalSetting(policy="never")
 
 
 @dataclass(frozen=True, slots=True)
@@ -90,7 +104,7 @@ class CompiledBundle:
     bundle_id: str
     tools: dict[str, Capability]
     skills: dict[str, Skill]
-    approvals: dict[str, ApprovalPolicyName]
+    approvals: dict[str, ApprovalSetting]
     connections: dict[str, ConnectionConfig] = field(default_factory=dict)
 
 
@@ -419,7 +433,7 @@ def _compile_bundle(discovery: BundleDiscovery) -> tuple[CompiledBundle | None, 
             bundle_id=discovery.bundle_id,
             tools=tools,
             skills=skills,
-            approvals=dict(config.approvals),
+            approvals=_normalize_approvals(config.approvals),
             connections=dict(config.connections),
         ),
         diagnostics,
@@ -487,9 +501,27 @@ def compile_agent(discovery: AgentDiscovery, fleet: FleetContext) -> CompiledAge
     if config is None:
         config = AgentConfig()
 
+    if (
+        config.model is not None
+        and config.model.thinking_budget_tokens is not None
+        and config.model.provider not in (None, "anthropic")
+    ):
+        diagnostics.append(
+            Diagnostic(
+                severity="error",
+                path=discovery.path,
+                message=(
+                    f"model.thinking_budget_tokens is set but model.provider "
+                    f"{config.model.provider!r} cannot honor a thinking budget "
+                    "(only 'anthropic' can today)"
+                ),
+                agent_id=discovery.agent_id,
+            )
+        )
+
     capabilities: dict[str, Capability] = {}
     skills: dict[str, Skill] = {}
-    approvals: dict[str, ApprovalPolicyName] = {}
+    approvals: dict[str, ApprovalSetting] = {}
 
     def merge_capabilities(new: dict[str, Capability]) -> None:
         for name, capability in new.items():
@@ -565,7 +597,8 @@ def compile_agent(discovery: AgentDiscovery, fleet: FleetContext) -> CompiledAge
     )
     merge_skills(own_skills)
 
-    approvals.update(config.approvals)  # agent-level approvals override bundle-level ones
+    # agent-level approvals override bundle-level ones
+    approvals.update(_normalize_approvals(config.approvals))
 
     for tool_name in approvals:
         # A bare key matches either an exact capability name or, via the
@@ -706,23 +739,23 @@ def compile_agent(discovery: AgentDiscovery, fleet: FleetContext) -> CompiledAge
     # its `Capability.tool.execute_fn` is `None` here: it genuinely is
     # executable, just not by this compile step — the runtime package
     # assembles its real delegation executor (see `CompiledAgent.subagents`).
+    def _manifest_tool(capability: Capability) -> ManifestTool:
+        setting = _resolve_approval(approvals, capability.tool.name)
+        return ManifestTool(
+            name=capability.tool.name,
+            description=capability.tool.description,
+            input_schema=dict(capability.tool.parameters),
+            source=capability.source,
+            approval=setting.policy,
+            ttl_seconds=setting.ttl_seconds,
+            idempotent=capability.tool.idempotent,
+            executable=(
+                True if capability.source == "subagent" else capability.tool.execute_fn is not None
+            ),
+        )
+
     manifest_tools = sorted(
-        (
-            ManifestTool(
-                name=capability.tool.name,
-                description=capability.tool.description,
-                input_schema=dict(capability.tool.parameters),
-                source=capability.source,
-                approval=_resolve_approval(approvals, capability.tool.name),
-                idempotent=capability.tool.idempotent,
-                executable=(
-                    True
-                    if capability.source == "subagent"
-                    else capability.tool.execute_fn is not None
-                ),
-            )
-            for capability in capabilities.values()
-        ),
+        (_manifest_tool(capability) for capability in capabilities.values()),
         key=lambda t: t.name,
     )
     manifest_skills = sorted(

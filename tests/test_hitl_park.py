@@ -364,6 +364,52 @@ async def test_expired_request_is_auto_denied_and_late_response_is_rejected(
     store.close()
 
 
+async def test_config_shaped_ttl_via_build_decision_hook_expires_and_denies_durably(
+    tmp_path: Path,
+) -> None:
+    """Design D7's actual wiring: a ``build_decision_hook(..., ttls=...)``
+    hook (what ``knot.authoring.runtime`` builds from an agent's ``approvals``
+    object-form config) parks a request carrying that TTL, and the existing
+    expiry sweep denies it durably once it elapses — same outcome as the
+    hand-written-hook scenario above, reached through the real config path.
+    """
+    db_path = tmp_path / "sessions.db"
+    store = SessionStore(db_path)
+    session = store.create_session("agent_a")
+
+    tool, tool_calls = _recording_tool("sensitive_op")
+    hook = build_decision_hook({"sensitive_op": "always"}, ttls={"sensitive_op": 1})
+
+    call = ToolCall(id="call_1", name="sensitive_op", arguments={})
+    provider = FakeProvider([reply(tool_calls=[call])])
+    harness, subscriber = _make_harness(
+        store, session.session_id, provider, tools=[tool], tool_decision_hook=hook
+    )
+
+    events = [event async for event in harness.prompt("go")]
+    request = events[-1].pending_requests[0]
+    assert request.ttl_seconds == 1
+    subscriber.release()
+
+    past_expiry = request.created_at + 5_000  # well past a 1-second ttl
+
+    outcome = await resolve_inputs(
+        store,
+        session.session_id,
+        {request.id: ApproveResponse(resolved_by="tester")},
+        tools={"sensitive_op": tool},
+        now_ms=past_expiry,
+    )
+    assert outcome.expired == [request.id]
+    assert outcome.rejected == [(request.id, "expired")]
+    assert tool_calls == []  # never ran: expiry always wins over a late approval
+
+    resolution_entry = _entries_by_type(store, session.session_id, "input_resolved")[0]
+    assert resolution_entry.payload["resolvedBy"] == "system:expiry"
+    assert resolution_entry.payload["decision"] == "denied"
+    store.close()
+
+
 async def test_revalidation_denies_when_tool_no_longer_exists(tmp_path: Path) -> None:
     db_path = tmp_path / "sessions.db"
     store = SessionStore(db_path)

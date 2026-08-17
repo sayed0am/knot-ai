@@ -71,10 +71,14 @@ def approved_tools(store: SessionStore, session_id: str) -> set[str]:
     return names
 
 
-def _resolve_policy(
-    policies: Mapping[str, ApprovalPolicy], tool_name: str, default: ApprovalPolicy
-) -> ApprovalPolicy:
-    """Exact key first, then longest matching ``__``-qualified suffix key."""
+def _resolve_policy[T](policies: Mapping[str, T], tool_name: str, default: T) -> T:
+    """Exact key first, then longest matching ``__``-qualified suffix key.
+
+    Generic over the mapped value: shared verbatim by ``build_decision_hook``
+    for both its ``policies`` lookup and its ``ttls`` lookup (design D7), so
+    a tool's configured TTL resolves through the exact same suffix-matching
+    rule as its policy.
+    """
     if tool_name in policies:
         return policies[tool_name]
 
@@ -94,6 +98,7 @@ def build_decision_hook(
     store: SessionStore | None = None,
     session_id: str | None = None,
     default: ApprovalPolicy = "never",
+    ttls: Mapping[str, int] | None = None,
 ) -> ToolDecisionHook:
     """Build a ``ToolDecisionHook`` that evaluates ``policies`` per call.
 
@@ -102,10 +107,18 @@ def build_decision_hook(
     back to requiring approval every time (fail closed, never fail open).
     Call arguments are treated as untrusted: no schema is assumed of them,
     they are only ever passed through to a custom policy verbatim.
+
+    ``ttls`` (design D7) supplies a per-tool TTL, resolved with the same
+    exact-then-suffix matching rule as ``policies``; every ``RequireApproval``
+    this hook returns for a matched tool carries that TTL (``None`` when
+    ``ttls`` is absent or has no matching key), so a configured expiry reaches
+    the resulting ``PendingInputRequest`` regardless of which of the three
+    named policies produced the park.
     """
 
     async def hook(call: ToolCall, tool: AgentTool | None) -> ToolDecision:
         policy = _resolve_policy(policies, call.name, default)
+        ttl = _resolve_policy(ttls, call.name, None) if ttls is not None else None
 
         if not isinstance(policy, str):
             return await policy(call.name, call.arguments, session_id)
@@ -113,13 +126,13 @@ def build_decision_hook(
         if policy == "never":
             return Allow()
         if policy == "always":
-            return RequireApproval()
+            return RequireApproval(ttl_seconds=ttl)
         # policy == "once"
         if store is None or session_id is None:
-            return RequireApproval()
+            return RequireApproval(ttl_seconds=ttl)
         if call.name in approved_tools(store, session_id):
             return Allow()
-        return RequireApproval()
+        return RequireApproval(ttl_seconds=ttl)
 
     return hook
 

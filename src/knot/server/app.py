@@ -32,15 +32,19 @@ replaceable in-flight/UI-adjacent state lives in memory.
 from __future__ import annotations
 
 import asyncio
+import hmac
 import json
+import logging
 from collections.abc import AsyncIterator, Mapping, Sequence
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse, Response, StreamingResponse
-from pydantic import BaseModel, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
+from starlette.types import ASGIApp, Receive, Scope, Send
 
 from knot.authoring.compile import CompiledFleet, compile_fleet
 from knot.authoring.config import load_agent_config
@@ -48,7 +52,7 @@ from knot.authoring.connections import check_connection_health
 from knot.authoring.discovery import Diagnostic
 from knot.authoring.manifest import serialize_manifest
 from knot.authoring.mcp_client import TransportFactory
-from knot.authoring.runtime import AgentRuntime
+from knot.authoring.runtime import AgentRuntime, CrashWindowNeedsOperator
 from knot.core.events import AgentEndEvent, AgentEvent
 from knot.core.harness import AgentHarness
 from knot.core.hitl.resume import (
@@ -57,6 +61,7 @@ from knot.core.hitl.resume import (
     DenyResponse,
     current_state,
     is_ready_to_continue,
+    operator_skip,
     resolve_inputs,
 )
 from knot.core.hitl.resume import (
@@ -68,6 +73,8 @@ from knot.core.session.state import rehydrate
 from knot.core.session.store import SessionStore, WriterAlreadyClaimedError
 from knot.providers.messages import current_timestamp_ms
 from knot.providers.provider import ModelProvider
+
+logger = logging.getLogger(__name__)
 
 __all__ = ["ServerState", "create_app", "create_app_from_paths"]
 
@@ -104,15 +111,87 @@ class ServerState:
     transport_factory: TransportFactory | None = None
     running: dict[str, _RunningTurn] = field(default_factory=dict)
     follow_ups: dict[str, list[str]] = field(default_factory=dict)
+    #: The crash windows serve-time repair (design D8) couldn't auto-repair,
+    #: snapshotted once at startup (see ``_lifespan``) and pruned in place by
+    #: ``POST /crash-windows/skip``. No new crash window can appear while
+    #: this process runs except through this same process's own crash — and
+    #: a process that has crashed isn't the one holding this list — so a
+    #: startup snapshot plus removal-on-skip stays correct for the process's
+    #: whole lifetime; there is no need to recompute it per request.
+    crash_windows: list[CrashWindowNeedsOperator] = field(default_factory=list)
+
+
+# ---------------------------------------------------------------------------
+# Startup: serve-time crash-window repair (design D8).
+# ---------------------------------------------------------------------------
+
+
+@asynccontextmanager
+async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
+    """Repair every crash window across every persisted session before this
+    process serves its first request (design D8). Whatever couldn't be
+    auto-repaired is snapshotted onto ``state.crash_windows`` for
+    ``GET /crash-windows``/``POST /crash-windows/skip`` — see
+    ``ServerState.crash_windows`` for why a startup snapshot suffices.
+    """
+    state: ServerState = app.state.knot
+    summary = await state.runtime.repair_all_crash_windows()
+    state.crash_windows = summary.needs_operator
+    logger.info(
+        "crash-window repair: %d repaired, %d need operator resolution",
+        summary.repaired_count,
+        len(summary.needs_operator),
+    )
+    yield
+
+
+# ---------------------------------------------------------------------------
+# Bearer-token auth (design D9). A raw ASGI middleware, not
+# ``BaseHTTPMiddleware``: the latter buffers/rewraps the whole response body,
+# which breaks a long-lived ``StreamingResponse`` SSE stream — this instead
+# passes ``receive``/``send`` straight through once the token checks out, so
+# a stream is untouched. Installed via ``app.add_middleware`` (outside
+# FastAPI's routing), so it covers every route, including ones added after
+# it — nothing to keep in sync as endpoints are added.
+# ---------------------------------------------------------------------------
+
+
+class _BearerAuthMiddleware:
+    def __init__(self, app: ASGIApp, *, token: str) -> None:
+        self.app = app
+        self.token = token
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+        headers = dict(scope.get("headers") or [])
+        presented = headers.get(b"authorization", b"").decode("latin-1")
+        prefix = "Bearer "
+        candidate = presented[len(prefix) :] if presented.startswith(prefix) else ""
+        # constant-time compare (design D9): never let a timing difference
+        # leak how much of a wrong token matched.
+        if not candidate or not hmac.compare_digest(candidate, self.token):
+            response = JSONResponse(
+                status_code=401,
+                content={"detail": "unauthorized"},
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+            await response(scope, receive, send)
+            return
+        await self.app(scope, receive, send)
 
 
 def create_app(
     *,
     fleet: CompiledFleet,
     store: SessionStore,
-    provider: ModelProvider,
+    provider: ModelProvider | None = None,
+    providers: Mapping[str, ModelProvider] | None = None,
+    default_provider: str = "anthropic",
     runtime_kwargs: Mapping[str, object] | None = None,
     transport_factory: TransportFactory | None = None,
+    auth_token: str | None = None,
 ) -> FastAPI:
     """Build the knot HTTP API app over one compiled fleet.
 
@@ -122,16 +201,39 @@ def create_app(
     ``GET /connections/health``) with nothing ever touching the network.
     ``runtime_kwargs`` reaches ``AgentRuntime`` verbatim (e.g. a
     ``connection_pool`` built with the same test transport).
+
+    Provider routing (design D2): pass either ``provider`` — the
+    pre-per-agent-routing single-provider convenience, equivalent to
+    ``providers={default_provider: provider}`` — or ``providers`` directly
+    for a fleet that actually spans more than one provider (as ``knot
+    serve`` does). Passing both, or neither, is a startup error.
+
+    ``auth_token`` (design D9): when given, every request must carry
+    ``Authorization: Bearer <auth_token>`` or is rejected 401 before routing
+    — see ``_BearerAuthMiddleware``. ``None`` (the default) is zero behavior
+    change: no auth is enforced, exactly as before this parameter existed.
     """
+    if providers is None:
+        if provider is None:
+            raise ValueError("create_app requires either provider= or providers=")
+        providers = {default_provider: provider}
+    elif provider is not None:
+        raise ValueError("create_app: pass provider= or providers=, not both")
     runtime = AgentRuntime(
-        fleet=fleet, store=store, provider=provider, **dict(runtime_kwargs or {})
+        fleet=fleet,
+        store=store,
+        providers=providers,
+        default_provider=default_provider,
+        **dict(runtime_kwargs or {}),
     )
     state = ServerState(
         fleet=fleet, store=store, runtime=runtime, transport_factory=transport_factory
     )
 
-    app = FastAPI(title="knot", version="0.1.0")
+    app = FastAPI(title="knot", version="0.1.0", lifespan=_lifespan)
     app.state.knot = state  # reach back into ServerState (tests, introspection)
+    if auth_token is not None:
+        app.add_middleware(_BearerAuthMiddleware, token=auth_token)
     _install_routes(app, state)
     return app
 
@@ -144,7 +246,12 @@ def create_app_from_paths(
     runtime_kwargs: Mapping[str, object] | None = None,
     transport_factory: TransportFactory | None = None,
 ) -> FastAPI:
-    """Convenience wrapper: compile ``root`` and open ``db_path`` directly."""
+    """Convenience wrapper: compile ``root`` and open ``db_path`` directly.
+
+    Single-provider only (see ``create_app``'s ``provider=`` convenience) —
+    a caller that needs multi-provider routing builds ``fleet``/``store``
+    itself and calls ``create_app(..., providers=...)`` directly.
+    """
     fleet = compile_fleet(root)
     store = SessionStore(db_path)
     return create_app(
@@ -289,6 +396,10 @@ class MessageBody(BaseModel):
     text: str
 
 
+class SteerBody(BaseModel):
+    message: str = Field(min_length=1)
+
+
 class InputResponseItem(BaseModel):
     action: Literal["approve", "deny", "answer"]
     by: str
@@ -315,6 +426,13 @@ class InputResponseItem(BaseModel):
 
 class InputBody(BaseModel):
     responses: dict[str, InputResponseItem]
+
+
+class CrashWindowSkipBody(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
+    session_id: str = Field(alias="sessionId")
+    tool_call_id: str = Field(alias="toolCallId")
 
 
 # ---------------------------------------------------------------------------
@@ -503,6 +621,33 @@ def _install_routes(app: FastAPI, state: ServerState) -> None:  # noqa: C901 - o
             pass
         return {"cancelled": True, "state": _effective_state(state, session_id)}
 
+    @app.post("/sessions/{session_id}/steer", status_code=202)
+    async def steer_session(session_id: str, body: SteerBody) -> dict:
+        """Deliver ``body.message`` into the session's currently-running turn.
+
+        Distinct from ``POST /sessions/{id}/messages`` (design D5): steering
+        reaches the CURRENT run at its next turn boundary via
+        ``AgentHarness.steer``, while ``/messages`` on a running session is
+        rejected outright and on a ``waiting`` one is queued as a follow-up
+        for AFTER the run. Requires an in-flight run (``state.running``); a
+        session with none — idle, waiting, or unknown — cannot be steered.
+        """
+        record = state.store.get_session(session_id)
+        if record is None:
+            raise HTTPException(status_code=404, detail=f"unknown session {session_id!r}")
+
+        running = state.running.get(session_id)
+        if running is None:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "session has no run in progress; steering requires a running turn — "
+                    "use POST /sessions/{id}/messages for an idle or parked session"
+                ),
+            )
+        running.harness.steer(body.message)
+        return {"delivered": True}
+
     # -- 9.5 fleet views ------------------------------------------------
 
     @app.get("/approvals")
@@ -524,11 +669,54 @@ def _install_routes(app: FastAPI, state: ServerState) -> None:  # noqa: C901 - o
                     {"sessionId": hop.session_id, "agentId": hop.agent_id} for hop in row.path
                 ],
                 "ageSeconds": max(0.0, (now - row.created_at) / 1000),
+                "ttlSeconds": row.request.ttl_seconds,
                 "payload": row.request.payload,
                 "createdAt": row.created_at,
             }
             for row in rows
         ]
+
+    # -- 9.6 crash-window repair (design D8) -----------------------------
+
+    @app.get("/crash-windows")
+    def list_crash_windows() -> list[dict]:
+        return [
+            {
+                "sessionId": window.session_id,
+                "toolCallId": window.tool_call_id,
+                "toolName": window.tool_name,
+                "reason": window.reason,
+            }
+            for window in state.crash_windows
+        ]
+
+    @app.post("/crash-windows/skip")
+    def skip_crash_window(body: CrashWindowSkipBody) -> dict:
+        window = next(
+            (
+                w
+                for w in state.crash_windows
+                if w.session_id == body.session_id and w.tool_call_id == body.tool_call_id
+            ),
+            None,
+        )
+        if window is None:
+            raise HTTPException(status_code=404, detail="no such crash window")
+
+        skipped_by = "operator"
+        operator_skip(
+            state.store, window.session_id, window.tool_call_id, by=skipped_by, reason=window.reason
+        )
+        # Startup snapshot, pruned in place (see ServerState.crash_windows) —
+        # never recomputed via a fresh detect_crash_windows scan.
+        state.crash_windows = [w for w in state.crash_windows if w is not window]
+        return {
+            "sessionId": window.session_id,
+            "toolCallId": window.tool_call_id,
+            "toolName": window.tool_name,
+            "skippedBy": skipped_by,
+            "reason": window.reason,
+        }
 
     @app.get("/connections/health")
     async def connections_health() -> list[dict]:

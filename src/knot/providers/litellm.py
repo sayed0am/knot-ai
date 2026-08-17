@@ -26,6 +26,7 @@ from knot.providers._provider_events import (
     ProviderAbortedEvent,
     ProviderErrorEvent,
     ProviderEvent,
+    ProviderResponseEndEvent,
     ProviderResponseStartEvent,
 )
 from knot.providers._retry import (
@@ -36,7 +37,7 @@ from knot.providers._retry import (
 )
 from knot.providers._stream import canonicalize_provider_stream
 from knot.providers.events import AssistantMessageEvent
-from knot.providers.messages import AgentMessage, ErrorType
+from knot.providers.messages import AgentMessage, ErrorType, UsageCost
 from knot.providers.openai_compatible import (
     _ChatStreamParser,
     _messages_to_openai_chat,
@@ -107,11 +108,24 @@ class LiteLLMProvider:
         tools: Sequence[ToolSpec],
         signal: CancellationToken | None = None,
         session_id: str | None = None,
+        max_tokens: int | None = None,
+        thinking_budget_tokens: int | None = None,
     ) -> AsyncIterator[AssistantMessageEvent]:
-        """Stream one response as assistant message events."""
-        del session_id
+        """Stream one response as assistant message events.
+
+        ``thinking_budget_tokens`` is accepted for protocol conformance but
+        has no chat-completions equivalent this adapter can honor, so it is
+        ignored — the compile-time diagnostic in ``knot.authoring.compile``
+        is what stops it from being set here silently.
+        """
+        del session_id, thinking_budget_tokens
         raw = self._stream_provider_events(
-            model=model, system=system, messages=messages, tools=tools, signal=signal
+            model=model,
+            system=system,
+            messages=messages,
+            tools=tools,
+            signal=signal,
+            max_tokens=max_tokens,
         )
         return canonicalize_provider_stream(
             raw, api="litellm", provider=self._provider_name, model=model
@@ -125,6 +139,7 @@ class LiteLLMProvider:
         messages: Sequence[AgentMessage],
         tools: Sequence[ToolSpec],
         signal: CancellationToken | None = None,
+        max_tokens: int | None = None,
     ) -> AsyncIterator[ProviderEvent]:
         async def iterator() -> AsyncIterator[ProviderEvent]:
             if signal is not None and signal.is_cancelled():
@@ -143,8 +158,9 @@ class LiteLLMProvider:
                 completion_kwargs["api_key"] = self._api_key
             if self._api_base is not None:
                 completion_kwargs["api_base"] = self._api_base
-            if self._max_tokens is not None:
-                completion_kwargs["max_tokens"] = self._max_tokens
+            resolved_max_tokens = max_tokens if max_tokens is not None else self._max_tokens
+            if resolved_max_tokens is not None:
+                completion_kwargs["max_tokens"] = resolved_max_tokens
 
             attempt = 0
             while True:
@@ -183,11 +199,13 @@ class LiteLLMProvider:
                     return
 
                 yield ProviderResponseStartEvent(model=model)
+                response_cost: float | None = None
                 try:
                     async for chunk in response:
                         if signal is not None and signal.is_cancelled():
                             yield ProviderAbortedEvent()
                             return
+                        response_cost = _extract_response_cost(chunk) or response_cost
                         events, stop = parser.feed(dumps(_chunk_to_dict(chunk)))
                         for event in events:
                             yield event
@@ -219,7 +237,11 @@ class LiteLLMProvider:
 
                 if parser.fatal:
                     return
-                for event in parser.finalize():
+                response_cost = response_cost or _extract_response_cost(response)
+                finalized = parser.finalize()
+                if response_cost is not None:
+                    _apply_response_cost(finalized, response_cost)
+                for event in finalized:
                     yield event
                 return
 
@@ -280,6 +302,29 @@ def _chunk_to_dict(chunk: Any) -> dict[str, Any]:
     if isinstance(chunk, Mapping):
         return dict(chunk)
     return {}
+
+
+def _extract_response_cost(candidate: Any) -> float | None:
+    """Read litellm's native per-response cost off a chunk or stream object.
+
+    litellm attaches ``_hidden_params["response_cost"]`` once cost is known
+    for a response; depending on version that lands on a streamed chunk, the
+    final chunk, or the stream wrapper itself, so this is called against
+    every chunk as it arrives and, as a fallback, against the exhausted
+    stream object — never computed locally (design D3: pass-through only).
+    """
+    hidden_params = getattr(candidate, "_hidden_params", None)
+    if not isinstance(hidden_params, Mapping):
+        return None
+    cost = hidden_params.get("response_cost")
+    return cost if isinstance(cost, int | float) and not isinstance(cost, bool) else None
+
+
+def _apply_response_cost(events: list[ProviderEvent], cost: float) -> None:
+    """Stamp ``cost`` onto the finalized response-end event's usage, if any."""
+    for event in events:
+        if isinstance(event, ProviderResponseEndEvent):
+            event.message.usage.cost = UsageCost(total=cost)
 
 
 __all__ = ["LiteLLMProvider"]

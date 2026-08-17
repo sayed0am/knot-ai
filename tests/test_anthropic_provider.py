@@ -352,3 +352,110 @@ def test_missing_api_key_raises(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
     with pytest.raises(RuntimeError, match="ANTHROPIC_API_KEY"):
         AnthropicProvider(api_key=None, base_url="https://x.test")
+
+
+async def test_per_call_max_tokens_reaches_the_request_payload() -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(
+            200,
+            text='data: {"type":"message_stop"}\n\n',
+            headers={"content-type": "text/event-stream"},
+        )
+
+    provider, client = _provider(handler)
+    async with client:
+        await _collect(
+            provider.stream_response(
+                model="claude-test",
+                system="s",
+                messages=[UserMessage(content="hi")],
+                tools=[],
+                max_tokens=777,
+            )
+        )
+
+    payload = loads(requests[0].content)
+    assert payload["max_tokens"] == 777
+
+
+async def test_per_call_max_tokens_overrides_constructor_default() -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(
+            200,
+            text='data: {"type":"message_stop"}\n\n',
+            headers={"content-type": "text/event-stream"},
+        )
+
+    provider, client = _provider(handler, max_tokens=1024)
+    async with client:
+        await _collect(
+            provider.stream_response(
+                model="claude-test",
+                system="s",
+                messages=[UserMessage(content="hi")],
+                tools=[],
+                max_tokens=2048,
+            )
+        )
+
+    payload = loads(requests[0].content)
+    assert payload["max_tokens"] == 2048
+
+
+async def test_per_call_thinking_budget_enables_extended_thinking() -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(
+            200,
+            text='data: {"type":"message_stop"}\n\n',
+            headers={"content-type": "text/event-stream"},
+        )
+
+    provider, client = _provider(handler)
+    async with client:
+        await _collect(
+            provider.stream_response(
+                model="claude-test",
+                system="s",
+                messages=[UserMessage(content="hi")],
+                tools=[],
+                thinking_budget_tokens=4096,
+            )
+        )
+
+    payload = loads(requests[0].content)
+    assert payload["thinking"] == {"type": "enabled", "budget_tokens": 4096}
+    # max_tokens grows to accommodate the thinking budget, as with the
+    # constructor-level path (see `_build_messages_payload`).
+    assert payload["max_tokens"] >= 4096 + 1024
+
+
+async def test_no_thinking_budget_omits_thinking_from_payload() -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(
+            200,
+            text='data: {"type":"message_stop"}\n\n',
+            headers={"content-type": "text/event-stream"},
+        )
+
+    provider, client = _provider(handler)
+    async with client:
+        await _collect(
+            provider.stream_response(
+                model="claude-test", system="s", messages=[UserMessage(content="hi")], tools=[]
+            )
+        )
+
+    payload = loads(requests[0].content)
+    assert "thinking" not in payload

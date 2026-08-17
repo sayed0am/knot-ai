@@ -78,6 +78,7 @@ def test_manifest_shape_has_expected_top_level_keys(tmp_path: Path) -> None:
     assert data["limits"] == {
         "maxTurns": None,
         "maxResultBytes": None,
+        "maxSessionTokens": None,
         "delegationMaxPerTurn": 4,
         "delegationMaxConcurrent": 2,
     }
@@ -117,6 +118,7 @@ def test_manifest_model_config_is_also_camel_case(tmp_path: Path) -> None:
         "name": "some-model",
         "maxTokens": 4096,
         "contextWindow": None,
+        "thinkingBudgetTokens": None,
     }
     assert data["limits"]["maxTurns"] == 20
     assert data["limits"]["delegationMaxPerTurn"] == 2

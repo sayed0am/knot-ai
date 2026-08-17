@@ -47,6 +47,28 @@ async def test_persistence_writes_exactly_the_message_entries_a_run_produces() -
         assert persisted_messages == expected_messages
 
 
+async def test_persisted_assistant_message_round_trips_null_cost() -> None:
+    with SessionStore(":memory:") as store:
+        session = store.create_session("agent_a")
+        provider = FakeProvider([reply("hello there")])
+        harness, subscriber = _make_harness(store, session.session_id, provider)
+
+        events = [event async for event in harness.prompt("hi")]
+        subscriber.release()
+
+        assistant_ends = [
+            e.message
+            for e in events
+            if isinstance(e, MessageEndEvent) and e.message.role == "assistant"
+        ]
+        assert assistant_ends[0].usage.cost is None
+
+        entries = store.entries(session.session_id)
+        persisted_messages = [entry_to_message(e) for e in entries]
+        persisted_assistant = next(m for m in persisted_messages if m.role == "assistant")
+        assert persisted_assistant.usage.cost is None
+
+
 async def test_persistence_writes_input_requested_entries_on_parked_run() -> None:
     async def hook(call: ToolCall, tool):
         return RequireApproval()

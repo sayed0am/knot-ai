@@ -45,7 +45,11 @@ def _runtime(
 ) -> tuple[AgentRuntime, SessionStore]:
     store = SessionStore(":memory:")
     runtime = AgentRuntime(
-        fleet=fleet, store=store, provider=provider, invariant_mode=invariant_mode
+        fleet=fleet,
+        store=store,
+        providers={"anthropic": provider},
+        default_provider="anthropic",
+        invariant_mode=invariant_mode,
     )
     return runtime, store
 
